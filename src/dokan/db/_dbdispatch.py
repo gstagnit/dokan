@@ -368,8 +368,13 @@ class DBDispatch(DBTask):
                 self.part_id = 0
                 return True
             if queue_full:
-                # > estimate accuracy reached: done adding jobs, dispatch what is already queued
-                return True  # pause repopulation
+                # > estimate accuracy reached: done adding jobs.  Dispatch what is already
+                # > queued *before* pausing: returning True here with jobs left QUEUED makes
+                # > `run()` sleep for a full dispatch interval (0.1 x job_max_runtime) while
+                # > the executors sit idle.  Pause only once nothing is left to dispatch.
+                if self.part_id <= 0 and drain_part_id > 0:
+                    self.part_id = drain_part_id
+                return self.part_id <= 0
             # > break when the queue is full enough to dispatch, or budget is exhausted
             if qterm or no_new_jobs:
                 # > Once no new jobs will be created, the batch thresholds no longer

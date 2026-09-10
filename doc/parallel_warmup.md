@@ -215,6 +215,24 @@ The merge cannot interpret such a block and now fails with an explicit
 message; those histograms must be declared as regular binned observables or
 dropped from `config.json` until the writer is fixed.
 
+## Dispatcher: idle executors before a dispatch wave (not warmup related)
+
+Observed on the fresh WJunsym run: after `MergeAll`, `DBDispatch` registered
+18 production jobs at 18:38:31 and only submitted them at 18:41:31, with no
+NNLOJET process running in between. Cause in `DBDispatch._repopulate`: once
+the registered jobs are predicted to reach the target accuracy it returned
+`queue_full = True`, and `run()` treats that as "throttled" and sleeps for the
+dispatch interval (`0.1 x job_max_runtime`, 180 s here, capped at 300 s)
+*before* handing the queued jobs to runners. Fixed: in that state
+`_repopulate` now selects a part with queued jobs and returns `False`, so the
+queued wave is dispatched first; it pauses only once nothing is left to
+dispatch. Verified on eeJJ (600 s runtime, 60 s interval): register-to-submit
+gap 120 s before, 0 s after. Also relevant for utilisation: with `n` active
+parts and `jobs_max_concurrent < n`, `submit` computes `jobs_batch_size = 1`,
+so warmup steps run a single seed; and production dispatch only starts once
+*all* pre-productions are done (`Entry`), which left 14 cores idle for about
+four minutes on this run while the slowest pre-productions finished.
+
 ## Edge cases
 
 - Partial seed failures: FAILED rows are excluded from the QC, the adapt uses
