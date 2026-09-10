@@ -79,6 +79,61 @@ class WarmupJobQC:
         )
 
 
+def combine_warmup_jobs(jobs: Sequence[WarmupJobQC]) -> WarmupJobQC:
+    """Fold the parallel seeds of one warmup step into single-job-equivalent numbers.
+
+    A warmup step runs `n` seeds with identical statistics on the *same* grid
+    (stage-3 warmups, combined afterwards by `NNLOJET --adapt`).  The QC and
+    the pre-production sizing reason about *one job* of the step: `size` is the
+    per-job statistics, `elapsed_time` the slowest seed (a per-job wall-time
+    estimate), `result` the inverse-variance weighted mean, and `error` the
+    error *one job* of that size would have (combined error times sqrt(n), so
+    that n identical seeds of error e reproduce e).  This keeps the sqrt(N)
+    scaling, the runtime estimates and `size_preproduction` dimensionally
+    correct without any change to their formulas; RELACC becomes conservative
+    by sqrt(n) w.r.t. the true combined accuracy of the step.  `chi2dof` is the
+    between-seed consistency test (n-1 dof); a single seed is returned as is
+    (its own between-iteration chi2dof).
+    """
+    if not jobs:
+        raise ValueError("combine_warmup_jobs: empty warmup step")
+    if len(jobs) == 1:
+        return jobs[0]
+
+    ncall: int = jobs[0].size.ncall  # uniform within a batch (enforced by DBRunner)
+    niter: int = max(j.size.niter for j in jobs)  # nominal; a premature termination only lowers it
+    elapsed_time: float = max(j.elapsed_time for j in jobs)
+    step_id: int = min(j.id for j in jobs)
+
+    valid: list[WarmupJobQC] = [j for j in jobs if j.error > 0.0 and math.isfinite(j.error)]
+    if not valid:
+        # > vanishing integral (0 +- 0) in every seed
+        return WarmupJobQC(
+            size=JobSize(ncall=ncall, niter=niter),
+            elapsed_time=elapsed_time,
+            result=sum(j.result for j in jobs) / len(jobs),
+            error=0.0,
+            chi2dof=0.0,
+            id=step_id,
+        )
+
+    n: int = len(valid)
+    weight_sum: float = sum(1.0 / j.error**2 for j in valid)
+    mean: float = sum(j.result / j.error**2 for j in valid) / weight_sum
+    error_single: float = math.sqrt(float(n) / weight_sum)
+    chi2dof: float = (
+        sum((j.result - mean) ** 2 / j.error**2 for j in valid) / float(n - 1) if n > 1 else valid[0].chi2dof
+    )
+    return WarmupJobQC(
+        size=JobSize(ncall=ncall, niter=niter),
+        elapsed_time=elapsed_time,
+        result=mean,
+        error=error_single,
+        chi2dof=chi2dof,
+        id=step_id,
+    )
+
+
 @dataclass(frozen=True)
 class WarmupSettingsQC:
     """The config subset that drives the warmup QC assessment."""
@@ -172,10 +227,12 @@ def assess_warmup(
 ) -> WarmupAssessmentQC:
     """Assess the warmup QC criteria and decide whether another warmup step is needed.
 
-    `past` are the successfully terminated warmup jobs, most recent first,
-    with degenerate rows (`ntot == 0`) excluded by the caller — `ntot` is a
-    divisor here; `iteration_errors` supplies the per-iteration errors of the most recent
-    warmup — a callable because fetching them costs file IO: it is only
+    `past` are the successfully terminated warmup *steps*, most recent first
+    (the parallel seeds of a step folded into one `WarmupJobQC` by
+    `combine_warmup_jobs`), with degenerate rows (`ntot == 0`) excluded by the
+    caller — `ntot` is a divisor here; `iteration_errors` supplies the
+    per-iteration errors of the most recent step (all seeds concatenated: the
+    relative spread is scale-free) — a callable because fetching them costs file IO: it is only
     invoked once the QC can actually conclude on data quality (CONST_ERR),
     never when the decision is already forced (no history, skip,
     MAX_INCREMENT, RUNTIME, or a mandatory increment step outstanding).  An

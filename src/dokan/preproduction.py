@@ -19,6 +19,7 @@ from .warmup import (
     WarmupJobQC,
     WarmupSettingsQC,
     assess_warmup,
+    combine_warmup_jobs,
     resize_failed_preproduction,
     size_preproduction,
 )
@@ -105,28 +106,47 @@ class PreProduction(DBTask):
             .order_by(Job.id.asc())
         ).first()
 
-    def _queue_job(self, session: Session, mode: ExecutionMode, size: JobSize) -> JobRef:
-        new_job = Job(
-            run_tag=self.run_tag,
-            part_id=self.part_id,
-            mode=mode,
-            policy=self.config["exe"]["policy"],
-            status=JobStatus.QUEUED,
-            timestamp=0.0,
-            ncall=size.ncall,
-            niter=size.niter,
-        )
-        session.add(new_job)
+    def _queue_job(self, session: Session, mode: ExecutionMode, size: JobSize, n: int = 1) -> JobRef:
+        """Queue `n` identical jobs (one warmup step = `n` parallel seeds); return the first."""
+        new_jobs: list[Job] = [
+            Job(
+                run_tag=self.run_tag,
+                part_id=self.part_id,
+                mode=mode,
+                policy=self.config["exe"]["policy"],
+                status=JobStatus.QUEUED,
+                timestamp=0.0,
+                ncall=size.ncall,
+                niter=size.niter,
+            )
+            for _ in range(max(1, n))
+        ]
+        session.add_all(new_jobs)
         self._safe_commit(session)
-        return JobRef(new_job.id)
+        return JobRef(min(job.id for job in new_jobs))
 
-    def _iteration_errors(self, job: Job) -> list[float]:
+    def _warmup_step_size(self, past_warmups: list[list[Job]]) -> int:
+        """Number of parallel seeds for the next warmup step.
+
+        The first step (no successful warmup yet) must run a single seed: no
+        grid file exists and NNLOJET creates a default one when missing, which
+        parallel seeds sharing a directory would race on.  Later steps use the
+        production batch size (already clamped to the executor pool at submit
+        time; clamp again here so a step can never out-size the pool).
+        """
+        if not past_warmups:
+            return 1
+        run: dict = self.config["run"]
+        return max(1, min(run["jobs_batch_size"], run["jobs_max_concurrent"], run["jobs_max_total"]))
+
+    def _iteration_errors(self, jobs: list[Job]) -> list[float]:
         # > QC measures that require the ExeData information; a job without parsed
         # > iterations (or with missing/partial metadata) gives no basis to assess
         # > error stability: empty list leaves CONST_ERR unset
-        exe_data: ExeData = ExeData(self._local(job.rel_path))
-        job_data: dict = exe_data.get("jobs", {}).get(job.id, {})
-        return [it["error"] for it in job_data.get("iterations", [])]
+        # > all seeds of a step share one ExeData (batch directory)
+        exe_data: ExeData = ExeData(self._local(jobs[0].rel_path))
+        exe_jobs: dict = exe_data.get("jobs", {})
+        return [it["error"] for job in jobs for it in exe_jobs.get(job.id, {}).get("iterations", [])]
 
     def _active_job_id(
         self,
@@ -153,10 +173,12 @@ class PreProduction(DBTask):
             query = query.where(Job.policy == self.config["exe"]["policy"])
         return session.scalars(query).first()
 
-    def _successful_warmups(self, session: Session) -> list[Job]:
-        """Successful warmups, most recent first, without degenerate rows.
+    def _successful_warmups(self, session: Session) -> list[list[Job]]:
+        """Successful warmup steps, most recent first, without degenerate rows.
 
-        Premature terminations can land DONE with `niter` rescaled to 0 (no
+        A step is the batch of parallel seeds that share one execution
+        directory (`rel_path`); its jobs are grouped together.  Premature
+        terminations can land DONE with `niter` rescaled to 0 (no
         statistics): no basis for QC or sizing, and `ntot` is a divisor in
         the assessment — exclude them (cf. the same guard in
         `_distribute_time`).
@@ -168,16 +190,26 @@ class PreProduction(DBTask):
             .where(Job.status.in_(JobStatus.success_list()))
             .order_by(Job.id.desc())
         ).all()
-        return [job for job in past_warmups if job.ncall and job.niter]
+        steps: dict[str, list[Job]] = {}  # insertion order == most recent step first
+        for job in past_warmups:
+            if not (job.ncall and job.niter):
+                continue
+            steps.setdefault(job.rel_path or f"job:{job.id}", []).append(job)
+        return list(steps.values())
 
-    def _assess_warmup(self, session: Session) -> WarmupAssessmentQC:
-        """Gather persisted warmup data and evaluate the pure QC decision."""
-        past_warmups: list[Job] = self._successful_warmups(session)
-        return assess_warmup(
-            past=[WarmupJobQC.from_row(job) for job in past_warmups],
+    def _assess_warmup(self, session: Session) -> tuple[WarmupAssessmentQC, list[list[Job]]]:
+        """Gather persisted warmup data and evaluate the pure QC decision.
+
+        Also returns the successful warmup steps (most recent first) so that
+        callers can size the next step without re-querying.
+        """
+        past_warmups: list[list[Job]] = self._successful_warmups(session)
+        assessment = assess_warmup(
+            past=[combine_warmup_jobs([WarmupJobQC.from_row(job) for job in step]) for step in past_warmups],
             iteration_errors=lambda: self._iteration_errors(past_warmups[0]),
             settings=WarmupSettingsQC.from_config(self.config),
         )
+        return assessment, past_warmups
 
     def _warmup_step(self, session: Session) -> JobRef | WarmupCompleteQC:
         """Advance normal warmup execution to pending work or completion."""
@@ -185,10 +217,12 @@ class PreProduction(DBTask):
         if active_warmup is not None:
             return JobRef(active_warmup)
 
-        assessment = self._assess_warmup(session)
+        assessment, past_warmups = self._assess_warmup(session)
         if isinstance(assessment, WarmupCompleteQC):
             return assessment
-        return self._queue_job(session, ExecutionMode.WARMUP, assessment.size)
+        return self._queue_job(
+            session, ExecutionMode.WARMUP, assessment.size, self._warmup_step_size(past_warmups)
+        )
 
     def seed_warmup_restart(self) -> WarmupRestartOutcome:
         """Seed or adopt a warmup restart for this part."""
@@ -201,10 +235,14 @@ class PreProduction(DBTask):
             if active_warmup is not None:
                 return WarmupRestartPending(JobRef(active_warmup))
 
-            assessment = self._assess_warmup(session)
+            assessment, past_warmups = self._assess_warmup(session)
             if isinstance(assessment, WarmupCompleteQC):
                 return assessment
-            return WarmupRestartSeeded(self._queue_job(session, ExecutionMode.WARMUP, assessment.size))
+            return WarmupRestartSeeded(
+                self._queue_job(
+                    session, ExecutionMode.WARMUP, assessment.size, self._warmup_step_size(past_warmups)
+                )
+            )
 
     def _production_step(self, session: Session) -> JobRef | None:
         """Advance pre-production to pending work, or return None once successful."""
@@ -238,10 +276,12 @@ class PreProduction(DBTask):
         else:
             # > size the pre-production (PP) with time estimates from the
             # > highest-statistics warmup job we got
-            past_warmups: list[Job] = self._successful_warmups(session)
+            past_warmups: list[list[Job]] = self._successful_warmups(session)
             if not past_warmups:
                 raise RuntimeError(f"pre-production: no warmup found for {self.part_id}")
-            sizing = size_preproduction(WarmupJobQC.from_row(past_warmups[0]), settings)
+            sizing = size_preproduction(
+                combine_warmup_jobs([WarmupJobQC.from_row(job) for job in past_warmups[0]]), settings
+            )
 
         if sizing.warning:
             self._logger(session, sizing.warning, level=LogLevel.WARN)
@@ -250,6 +290,9 @@ class PreProduction(DBTask):
     def _dispatch_then_resurrect(self, job: JobRef, stage: str):
         """Yield the bounded dispatch of `job_id`, then a resurrection when reached inline.
 
+        For a warmup, `job_id` is the first seed of the step: the bounded
+        dispatch batches all queued seeds of the step into one execution
+        directory, so the resurrection of that `rel_path` covers the whole step.
         Luigi only continues past a dynamic `yield` in the same pass when the
         yielded task was already complete at yield time; for a bounded dispatch
         that means `job_id` is no longer QUEUED, i.e. an already-active job from

@@ -175,9 +175,13 @@ class DBRunner(DBTask):
         run_file: Path = self.job_path / DBRunner._file_run
         template = RuncardTemplate(self._local(self.config["run"]["template"]))
         channel_region: str = f"region = {part_region}" if part_region else ""
+        # > warmups run without grid adaption (kakuhen stage 3): every seed dumps its
+        # > accumulated grid data (`*.s<seed>.khd`) and the Executor combines them into
+        # > the grid state file (`*.khs`) with `NNLOJET --adapt` once the batch is done
+        sweep_opts: str = f"{self.niter},noadapt" if self.mode == ExecutionMode.WARMUP else f"{self.niter}"
         template.fill(
             run_file,
-            sweep=f"{self.mode!s} = {self.ncall}[{self.niter}]",
+            sweep=f"{self.mode!s} = {self.ncall}[{sweep_opts}]",
             run="",
             channels=part_string,
             channels_region=channel_region,
@@ -194,6 +198,9 @@ class DBRunner(DBTask):
             for wfile in LW_data["output_files"]:
                 # > skip "*.s<seed>.*" files & job files
                 if re.match(r"^.*\.s[0-9]+\.[^0-9.]+$", wfile):
+                    continue
+                # > skip backup/temporary grid state files left behind by `NNLOJET --adapt`
+                if re.match(r"^.*\.khs\.(bak|new|old)$", wfile):
                     continue
                 if re.match(r"^job.*$", wfile):
                     continue

@@ -67,6 +67,7 @@ class DBDispatch(DBTask):
             self.__class__.__name__ + f"[{self.id}" + (f",{self._n}" if self.id == 0 else "") + "]"
         )
         self.part_id: int = 0  # set in `_repopulate`
+        self.job_mode: ExecutionMode | None = None  # set in `_repopulate` (bounded dispatch only)
 
     @property
     def resources(self):  # type: ignore
@@ -206,6 +207,7 @@ class DBDispatch(DBTask):
                 self.part_id = 0
                 return queue_full
             self.part_id = job.part_id
+            self.job_mode = ExecutionMode(job.mode)
             return queue_full
 
         def safe_rel_error(numerator: float, denominator: float) -> float:
@@ -615,6 +617,17 @@ class DBDispatch(DBTask):
                 stmt = self.select_job.where(Job.status == JobStatus.QUEUED)
                 if self.id == 0:
                     stmt = stmt.where(Job.part_id == self.part_id)
+                elif self.job_mode == ExecutionMode.WARMUP:
+                    # > a warmup step = all QUEUED warmup seeds of this part & submission:
+                    # > dispatch them as one batch (one directory) so their `.khd` grid data
+                    # > can be combined by `NNLOJET --adapt` after the step completes
+                    stmt = (
+                        select(Job)
+                        .where(Job.run_tag == self.run_tag)
+                        .where(Job.part_id == self.part_id)
+                        .where(Job.mode == ExecutionMode.WARMUP)
+                        .where(Job.status == JobStatus.QUEUED)
+                    )
                 # > compile batch in `id` order
                 jobs: list[Job] = [*session.scalars(stmt.order_by(Job.id.asc())).all()]
                 if jobs:

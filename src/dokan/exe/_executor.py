@@ -5,8 +5,12 @@ and a factory design pattern to obtain tasks for the different policies.
 """
 
 import logging
+import os
+import re
+import subprocess
 import time
 from abc import ABCMeta, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
@@ -14,7 +18,7 @@ import luigi
 
 from .._types import GenericPath
 from ..db._loglevel import LogLevel
-from ._exe_config import ExecutionPolicy
+from ._exe_config import ExecutionMode, ExecutionPolicy
 from ._exe_data import ExeData
 
 
@@ -183,6 +187,66 @@ class Executor(luigi.Task, metaclass=ABCMeta):
         return exec_cls(*args, **kwargs)
 
     @staticmethod
+    def adapt_warmup_grids(exe_data: ExeData, log: Callable[[str, LogLevel], None]) -> None:
+        """Combine the grid data of a warmup batch into its grid state file(s).
+
+        Warmups run without grid adaption (`warmup = N[M,noadapt]`): every
+        seed dumps its accumulated data to `<GRID>.s<seed>.khd` while the
+        grid state `<GRID>.khs` stays fixed.  Once the batch is done, the
+        data files of all seeds that produced a result are folded into the
+        state file in place with `NNLOJET --adapt`, which keeps the previous
+        state as `<GRID>.khs.bak`.
+
+        Idempotent: an existing `.bak` marks an already adapted grid and the
+        step is skipped (re-adapting would fail on the data-file hash check).
+        A stale `<GRID>.khs.new` from an interrupted adaption would make
+        NNLOJET refuse to run and is removed first.  NNLOJET ends usage errors
+        with a plain `stop` (exit code 0), so success is asserted by the
+        return code *and* the presence of the `.bak` file.
+
+        Raises
+        ------
+        RuntimeError
+            The grid adaption failed (task-level fault: the step must not be
+            finalized with an un-adapted grid).
+        """
+        if exe_data.get("mode") != ExecutionMode.WARMUP:
+            return
+        path: Path = Path(exe_data.path)
+        seeds_ok: set[int] = {
+            int(job["seed"]) for job in exe_data.get("jobs", {}).values() if "result" in job
+        }
+        for khs in sorted(path.glob("*.khs")):
+            bak: Path = khs.with_name(khs.name + ".bak")
+            new: Path = khs.with_name(khs.name + ".new")
+            if bak.exists():
+                log(f"adapt: {khs.name} already adapted (found {bak.name}), skipping", LogLevel.DEBUG)
+                continue
+            khd: list[Path] = []
+            for data_file in sorted(path.glob(f"{khs.stem}.s*.khd")):
+                match = re.search(r"\.s(\d+)\.khd$", data_file.name)
+                if match and int(match.group(1)) in seeds_ok:
+                    khd.append(data_file)
+            if not khd:
+                log(f"adapt: no usable data files for {khs.name}, skipping", LogLevel.WARN)
+                continue
+            new.unlink(missing_ok=True)
+            # > `-d` is greedy (consumes all remaining arguments): keep it last
+            cmd: list[str] = [exe_data["exe"], "--adapt", "-i", khs.name, "-d", *(f.name for f in khd)]
+            log("adapt: " + " ".join(cmd), LogLevel.INFO)
+            job_env = os.environ.copy()
+            job_env["OMP_NUM_THREADS"] = "1"
+            job_env["OMP_STACKSIZE"] = "1024M"
+            adapt_out = subprocess.run(cmd, cwd=path, env=job_env, capture_output=True, text=True)
+            success: bool = adapt_out.returncode == 0 and bak.exists()
+            log(
+                f"adapt: {khs.name} (rc = {adapt_out.returncode}):\n" + adapt_out.stdout + adapt_out.stderr,
+                LogLevel.INFO if success else LogLevel.ERROR,
+            )
+            if not success:
+                raise RuntimeError(f"grid adaption failed for {khs} (rc = {adapt_out.returncode})")
+
+    @staticmethod
     def templates() -> list[GenericPath]:
         """List of built-in templates for this executor.
 
@@ -227,7 +291,8 @@ class Executor(luigi.Task, metaclass=ABCMeta):
         1. Scanning for existing results (recovery).
         2. Initializing/writing mutable `ExeData`.
         3. Invoking `exe()` if work is still incomplete.
-        4. Re-scanning outputs and finalizing to `job.json`.
+        4. Re-scanning outputs, combining warmup grid data (`--adapt`), and
+           finalizing to `job.json`.
 
         Notes
         -----
@@ -255,4 +320,7 @@ class Executor(luigi.Task, metaclass=ABCMeta):
             self._logger("Executor::run: skipped exe()", level=LogLevel.DEBUG)
 
         self.exe_data.scan_dir([self._file_log], fs_max_retry=self.FS_MAX_RETRY, fs_delay=self.FS_DELAY)
+        # > warmup: fold the seeds' grid data into the grid state (no re-scan afterwards:
+        # > the `.bak` left behind must not become a tracked output that propagates)
+        self.adapt_warmup_grids(self.exe_data, self._logger)
         self.exe_data.finalize()

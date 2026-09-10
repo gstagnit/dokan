@@ -188,5 +188,11 @@ class DBResurrect(DBTask):
             self._safe_commit(session)
 
             # In recovery-only mode, finalize ExeData once tracked jobs are terminated.
+            # > this path never runs the Executor: combine the warmup grid data here
+            # > (idempotent) so an un-adapted grid can not propagate to the next step
             if self._recover_jobs and self._all_jobs_terminated(session, list(self._recover_jobs)):
+                Executor.adapt_warmup_grids(
+                    self.exe_data,
+                    lambda message, level=LogLevel.INFO: self._logger(session, message, level=level),
+                )
                 self.exe_data.finalize()
