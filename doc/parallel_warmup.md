@@ -165,6 +165,56 @@ No new key. Relevant existing keys:
 
 Grid adaptation now happens once per step instead of once per iteration.
 
+## Integrator choice: Basin or Vegas
+
+Nothing in dokan depends on the integrator. The runcard line
+`integrator = BASIN[ndiv1=..,ndiv2=..]` or `integrator = VEGAS[ndiv=..]` is
+kept verbatim by the runcard template (only `iseed`, `warmup`, `production`
+and the dokan placeholders are stripped), both kakuhen integrators write the
+same `.khs`/`.khd` files, and `NNLOJET --adapt` selects the algorithm from the
+state-file header. Verified end to end with `integrator = VEGAS[ndiv=80]` on
+the eeJJ example (log: "Integrating using Vegas algorithm, stage 3",
+`--adapt`: "adapt called for Vegas"). The legacy Fortran `Vegas.f90` is dead
+code in NNLOJET and is not supported.
+
+## Logging
+
+The `--adapt` command line and NNLOJET's output are logged at DEBUG level in
+`exe.log` (which `DBRunner` forwards to the workflow log); on success a single
+INFO line `adapt: <GRID>.khs <- N data file(s)` is emitted, on failure the
+full output at ERROR.
+
+## Merge stage: findings from the WJunsym test run (not warmup related)
+
+The first full run of `test/flav_release/WmC_ATLAS_2026.run` completed all
+warmups and pre-productions and then appeared to hang in `MergePart`. Two
+independent causes, both pre-existing on the `hdf5` branch:
+
+1. **Single-file histogram output was unsupported.** `HISTOGRAMS > histos`
+   makes NNLOJET write all observables of a job into one
+   `<PROC>.<RUN>.<CONTRIB>.histos.s<SEED>.dat`, each block introduced by
+   `#name: <obs>`. `build_obs_group` raised
+   `NotImplementedError("single_file option not implemented yet")` (the older
+   merge on `main` supported it). Now implemented: `_open_dat(path, obs_name)`
+   yields either the whole file or one observable's block, every observable is
+   mapped to the same job files, and the `MergePart` resume check is keyed per
+   observable as well.
+2. **Failures looked like a hang.** Luigi prints task exceptions to the
+   console only (hidden behind the live monitor) and retries a failed task
+   after `retry_delay` (900 s by default), so 48 failing `MergePart`s looked
+   stalled. `MergePart` now logs a staging failure to the workflow log at
+   ERROR before re-raising, and the parser reports malformed rows with file,
+   observable and row number instead of a bare `AssertionError`.
+
+Still open, on the NNLOJET side: the runcard's
+`cross > cross_1j_IFN_neg nbins = 36 min = 27 max = 207` histograms (8 of
+them) are written with a total-cross-section header (`#nx: 0`, no bin-edge
+labels) followed by one total row *and* 36 binned rows with three bin-edge
+columns; this happens for per-observable files too (`driver/core/Histograms.f90`).
+The merge cannot interpret such a block and now fails with an explicit
+message; those histograms must be declared as regular binned observables or
+dropped from `config.json` until the writer is fixed.
+
 ## Edge cases
 
 - Partial seed failures: FAILED rows are excluded from the QC, the adapt uses

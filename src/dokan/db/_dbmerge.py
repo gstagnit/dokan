@@ -295,12 +295,18 @@ class MergePart(DBMerge):
                                 hdf5_obs_ready.add(obs)
                                 hdf5_obs_files[obs] = set(h5grp["files"].asstr()[:nv])
 
+        # > single-file histogram output: every observable is fed by the same job files
+        obs_in_files: dict[str, list[GenericPath]] = (
+            in_files
+            if single_file is None
+            else {obs: in_files.get(single_file, []) for obs in self.config["run"]["histograms"]}
+        )
         resume_hdf5 = (
             merge_in_progress
             and bool(hdf5_obs_ready)
             and all(
                 set(files).issubset(hdf5_obs_files.get(obs, set()))
-                for obs, files in in_files.items()
+                for obs, files in obs_in_files.items()
                 if files
             )
         )
@@ -310,15 +316,27 @@ class MergePart(DBMerge):
                     job.status = JobStatus.MERGED
                 self._safe_commit(session)
         if not resume_hdf5:
-            build_obs_group(
-                hdf5_file,
-                pt_name,
-                in_files,
-                self.config["run"]["histograms"],
-                self._path,
-                single_file=single_file,
-                merge_in_progress=merge_in_progress,
-            )
+            try:
+                build_obs_group(
+                    hdf5_file,
+                    pt_name,
+                    in_files,
+                    self.config["run"]["histograms"],
+                    self._path,
+                    single_file=single_file,
+                    merge_in_progress=merge_in_progress,
+                )
+            except Exception as e:
+                # > surface the failure in the workflow log: Luigi only prints it to the
+                # > console (hidden behind the live monitor) and retries after `retry_delay`
+                # > (900s by default), which looks like a stalled merge
+                with self.session as session:
+                    self._logger(
+                        session,
+                        self._logger_prefix + f"::run:  staging histograms failed: {e}",
+                        level=LogLevel.ERROR,
+                    )
+                raise
 
         # > find all obs that have data in the HDF5 file; batch-read each group's freshness
         # > identity `(ndat_valid, version token)` in the same pass so the completeness

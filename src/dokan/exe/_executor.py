@@ -233,18 +233,20 @@ class Executor(luigi.Task, metaclass=ABCMeta):
             new.unlink(missing_ok=True)
             # > `-d` is greedy (consumes all remaining arguments): keep it last
             cmd: list[str] = [exe_data["exe"], "--adapt", "-i", khs.name, "-d", *(f.name for f in khd)]
-            log("adapt: " + " ".join(cmd), LogLevel.INFO)
+            log("adapt: " + " ".join(cmd), LogLevel.DEBUG)
             job_env = os.environ.copy()
             job_env["OMP_NUM_THREADS"] = "1"
             job_env["OMP_STACKSIZE"] = "1024M"
             adapt_out = subprocess.run(cmd, cwd=path, env=job_env, capture_output=True, text=True)
             success: bool = adapt_out.returncode == 0 and bak.exists()
+            # > the NNLOJET output is noise on success (DEBUG); keep it verbose on failure
             log(
                 f"adapt: {khs.name} (rc = {adapt_out.returncode}):\n" + adapt_out.stdout + adapt_out.stderr,
-                LogLevel.INFO if success else LogLevel.ERROR,
+                LogLevel.DEBUG if success else LogLevel.ERROR,
             )
             if not success:
                 raise RuntimeError(f"grid adaption failed for {khs} (rc = {adapt_out.returncode})")
+            log(f"adapt: {khs.name} <- {len(khd)} data file(s)", LogLevel.INFO)
 
     @staticmethod
     def templates() -> list[GenericPath]:
