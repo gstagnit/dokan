@@ -57,7 +57,12 @@ class JobSize:
 
 @dataclass(frozen=True)
 class WarmupJobQC:
-    """The QC-relevant numbers of one successfully terminated warmup job."""
+    """The QC-relevant numbers of one successfully terminated warmup step.
+
+    A step is `nseeds` parallel jobs of identical `size` on the same grid:
+    `size` and `elapsed_time` are *per seed*, `result`/`error`/`chi2dof`
+    describe the combination of all seeds, `ntot` is the step total.
+    """
 
     size: JobSize
     elapsed_time: float
@@ -65,6 +70,12 @@ class WarmupJobQC:
     error: float
     chi2dof: float
     id: int = 0
+    nseeds: int = 1
+
+    @property
+    def ntot(self) -> int:
+        """Total statistics of the step (all seeds)."""
+        return self.size.ntot * self.nseeds
 
     @classmethod
     def from_row(cls, row) -> "WarmupJobQC":
@@ -80,18 +91,14 @@ class WarmupJobQC:
 
 
 def combine_warmup_jobs(jobs: Sequence[WarmupJobQC]) -> WarmupJobQC:
-    """Fold the parallel seeds of one warmup step into single-job-equivalent numbers.
+    """Fold the parallel seeds of one warmup step into one `WarmupJobQC`.
 
     A warmup step runs `n` seeds with identical statistics on the *same* grid
-    (stage-3 warmups, combined afterwards by `NNLOJET --adapt`).  The QC and
-    the pre-production sizing reason about *one job* of the step: `size` is the
-    per-job statistics, `elapsed_time` the slowest seed (a per-job wall-time
-    estimate), `result` the inverse-variance weighted mean, and `error` the
-    error *one job* of that size would have (combined error times sqrt(n), so
-    that n identical seeds of error e reproduce e).  This keeps the sqrt(N)
-    scaling, the runtime estimates and `size_preproduction` dimensionally
-    correct without any change to their formulas; RELACC becomes conservative
-    by sqrt(n) w.r.t. the true combined accuracy of the step.  `chi2dof` is the
+    (stage-3 warmups, combined afterwards by `NNLOJET --adapt`).  `size` and
+    `elapsed_time` stay *per seed* (the slowest seed gives the wall-time
+    estimate of one job), `result` is the inverse-variance weighted mean,
+    `error` the combined error of all seeds, `nseeds = n` records the step
+    multiplicity so that `ntot` is the step total.  `chi2dof` is the
     between-seed consistency test (n-1 dof); a single seed is returned as is
     (its own between-iteration chi2dof).
     """
@@ -104,6 +111,7 @@ def combine_warmup_jobs(jobs: Sequence[WarmupJobQC]) -> WarmupJobQC:
     niter: int = max(j.size.niter for j in jobs)  # nominal; a premature termination only lowers it
     elapsed_time: float = max(j.elapsed_time for j in jobs)
     step_id: int = min(j.id for j in jobs)
+    nseeds: int = len(jobs)
 
     valid: list[WarmupJobQC] = [j for j in jobs if j.error > 0.0 and math.isfinite(j.error)]
     if not valid:
@@ -115,12 +123,13 @@ def combine_warmup_jobs(jobs: Sequence[WarmupJobQC]) -> WarmupJobQC:
             error=0.0,
             chi2dof=0.0,
             id=step_id,
+            nseeds=nseeds,
         )
 
     n: int = len(valid)
     weight_sum: float = sum(1.0 / j.error**2 for j in valid)
     mean: float = sum(j.result / j.error**2 for j in valid) / weight_sum
-    error_single: float = math.sqrt(float(n) / weight_sum)
+    error_comb: float = math.sqrt(1.0 / weight_sum)
     chi2dof: float = (
         sum((j.result - mean) ** 2 / j.error**2 for j in valid) / float(n - 1) if n > 1 else valid[0].chi2dof
     )
@@ -128,9 +137,10 @@ def combine_warmup_jobs(jobs: Sequence[WarmupJobQC]) -> WarmupJobQC:
         size=JobSize(ncall=ncall, niter=niter),
         elapsed_time=elapsed_time,
         result=mean,
-        error=error_single,
+        error=error_comb,
         chi2dof=chi2dof,
         id=step_id,
+        nseeds=nseeds,
     )
 
 
@@ -177,10 +187,11 @@ class WarmupCompleteQC:
 
 @dataclass(frozen=True)
 class WarmupRequiredQC:
-    """Another warmup job is required with `size` statistics."""
+    """Another warmup step is required: `nseeds` parallel jobs of `size` each."""
 
     size: JobSize
     flags: WarmupFlag = _NO_FLAGS
+    nseeds: int = 1
 
 
 WarmupAssessmentQC = WarmupCompleteQC | WarmupRequiredQC
@@ -224,8 +235,16 @@ def assess_warmup(
     past: Sequence[WarmupJobQC],
     iteration_errors: Callable[[], Sequence[float]],
     settings: WarmupSettingsQC,
+    nseeds_next: int = 1,
 ) -> WarmupAssessmentQC:
     """Assess the warmup QC criteria and decide whether another warmup step is needed.
+
+    `nseeds_next` is the number of parallel seeds available for the next step:
+    the step's total statistics (grown by `fac_increment` w.r.t. the last
+    step's total) is split evenly over them, with a per-seed floor of
+    `ncall_start` (fewer seeds are used if the floor would over-shoot the
+    plan), and the runtime cap is applied per seed.  The first step always
+    runs a single seed (it creates the grid file).
 
     `past` are the successfully terminated warmup *steps*, most recent first
     (the parallel seeds of a step folded into one `WarmupJobQC` by
@@ -269,10 +288,15 @@ def assess_warmup(
     if grid_converged():
         wflag |= WarmupFlag.GRID
 
-    # > settings for the next warmup (NW) step
-    NW_ncall: int = int(LW.size.ncall * settings.fac_increment)
+    # > settings for the next warmup (NW) step: grow the *step total* and split it
+    # > over the seeds available now (per-seed floor: `ncall_start`)
+    NW_ncall_total: int = int(LW.size.ncall * LW.nseeds * settings.fac_increment)
+    NW_nseeds: int = max(1, nseeds_next)
+    NW_ncall: int = max(-(-NW_ncall_total // NW_nseeds), settings.start.ncall)  # ceil division
+    NW_nseeds = max(1, min(NW_nseeds, -(-NW_ncall_total // NW_ncall)))
     NW_niter: int = LW.size.niter
-    NW_ntot: int = NW_ncall * NW_niter
+    NW_ntot: int = NW_ncall * NW_niter  # per seed
+    # > per-seed wall-time estimate from the per-seed numbers of the last step
     NW_time_estimate: float = LW.elapsed_time * float(NW_ntot) / float(LW.size.ntot)
     # > try to accommodate runtime limit by reducing iterations
     if NW_time_estimate > settings.job_max_runtime:
@@ -284,7 +308,7 @@ def assess_warmup(
 
     # > need to ensure that we have enough increment steps
     if WarmupFlag.MIN_INCREMENT not in wflag:
-        return WarmupRequiredQC(size=next_size, flags=wflag)
+        return WarmupRequiredQC(size=next_size, flags=wflag, nseeds=NW_nseeds)
 
     # > only now can the QC conclude on data quality: fetch the iteration
     # > errors (the sole file-IO input) for the error-stability criterion
@@ -294,12 +318,12 @@ def assess_warmup(
         if err_mean == 0.0 or err_stdv / err_mean < settings.max_err_rel_var:
             wflag |= WarmupFlag.CONST_ERR
 
-    # > next-to-last warmup (NLW): error scaling with statistics
+    # > next-to-last warmup (NLW): error scaling with the step-total statistics
     if len(past) >= 2:
         NLW: WarmupJobQC = past[1]
         scaling: float = 1.0
         if NLW.error != 0.0:
-            scaling = (LW.error / NLW.error) * math.sqrt(float(LW.size.ntot) / float(NLW.size.ntot))
+            scaling = (LW.error / NLW.error) * math.sqrt(float(LW.ntot) / float(NLW.ntot))
         if abs(scaling - 1.0) <= settings.scaling_window:
             wflag |= WarmupFlag.SCALING
 
@@ -317,7 +341,7 @@ def assess_warmup(
         return WarmupCompleteQC(flags=wflag)
 
     # > need more warmup iterations
-    return WarmupRequiredQC(size=next_size, flags=wflag)
+    return WarmupRequiredQC(size=next_size, flags=wflag, nseeds=NW_nseeds)
 
 
 def size_preproduction(last_warmup: WarmupJobQC, settings: PreProductionSettings) -> SizingDecision:
@@ -338,11 +362,13 @@ def size_preproduction(last_warmup: WarmupJobQC, settings: PreProductionSettings
             ),
         )
 
+    # > per-seed statistics and runtime: what one production job can do in the time budget
     PP_ntot: int = last_warmup.size.ntot * int(
         settings.penalty_wrt_warmup * settings.job_max_runtime / last_warmup.elapsed_time
     )
     if last_warmup.result != 0.0 and last_warmup.error != 0.0:
-        PP_ntot_acc: int = last_warmup.size.ntot * int(
+        # > step-total statistics and combined error: what is needed for the target accuracy
+        PP_ntot_acc: int = last_warmup.ntot * int(
             (last_warmup.error / last_warmup.result / settings.target_rel_acc) ** 2
         )
         PP_ntot = min(PP_ntot, PP_ntot_acc)

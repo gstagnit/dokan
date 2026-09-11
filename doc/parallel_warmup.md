@@ -34,9 +34,9 @@ step 1  (single seed, creates the grid)
                                NNLOJET --adapt -i X.khs -d X.s1.khd
                                -> X.khs (adapted), X.khs.bak
 
-step 2  (N seeds, N = run.jobs_batch_size)
+step 2  (N seeds: the free executor slots shared among the parts still in warmup)
   raw/warmup/<Part>/s2-4/      input: X.khs copied from step 1
-                               job.run: warmup = 2000[2,noadapt]
+                               job.run: warmup = 667[2,noadapt]   (step total 2000 split over 3 seeds)
                                seeds 2,3,4 -> X.s2.khd X.s3.khd X.s4.khd
                                NNLOJET --adapt -i X.khs -d X.s2.khd X.s3.khd X.s4.khd
                                -> X.khs (adapted), X.khs.bak
@@ -65,35 +65,51 @@ Facts the design relies on:
 
 ## Changes by file
 
-### `warmup.py` — `combine_warmup_jobs`
+### `warmup.py` — steps with `nseeds`, `combine_warmup_jobs`, seed splitting
 
-Pure function folding the seeds of one step into *single-job-equivalent*
-numbers so that `assess_warmup` and `size_preproduction` are untouched:
+`WarmupJobQC` describes a *step*: `size` and `elapsed_time` are per seed,
+`result`/`error`/`chi2dof` the combination of all seeds, `nseeds` the
+multiplicity and `ntot = size.ntot * nseeds` the step total.
+`combine_warmup_jobs` folds the seeds of one step:
 
-| field | value | why |
-|---|---|---|
-| `size` | `(ncall, max niter)` of one job | runtime estimates and `ntot` are per job |
-| `elapsed_time` | slowest seed | per-job wall time vs. `job_max_runtime` |
-| `result` | inverse-variance weighted mean over seeds with `error > 0` | |
-| `error` | `sqrt(n / Σ 1/σ_i²)` = combined error × √n | the error one job of that size would have; keeps the √N scaling and the pre-production sizing dimensionally right |
-| `chi2dof` | `Σ (x_i − x̄)²/σ_i² / (n−1)` for `n > 1` | between-seed consistency |
-| `id` | smallest job id of the step | |
+| field | value |
+|---|---|
+| `size` | `(ncall, max niter)` of one seed |
+| `elapsed_time` | slowest seed (wall time of one job) |
+| `result` | inverse-variance weighted mean over seeds with `error > 0` |
+| `error` | combined error `sqrt(1 / Σ 1/σ_i²)` |
+| `chi2dof` | `Σ (x_i − x̄)²/σ_i² / (n−1)` for `n > 1` (between-seed consistency) |
+| `nseeds`, `id` | number of seeds, smallest job id |
 
-A single seed is returned as is. If every seed is `0 ± 0` the result is the
-plain mean with error and chi2dof 0. Consequences: RELACC is judged on the
-single-job-equivalent error and is therefore conservative by √n with respect
-to the true combined accuracy of the step; CONST_ERR now measures the
-stability of the error estimate on a fixed grid within a step (the errors of
-all seeds' iterations are concatenated; the criterion is a relative spread and
-scale-free).
+A single seed is returned as is; if every seed is `0 ± 0` the result is the
+plain mean with error and chi2dof 0. CONST_ERR measures the stability of the
+error estimate on a fixed grid within a step (all seeds' iteration errors
+concatenated; a relative, scale-free spread).
+
+`assess_warmup(past, iteration_errors, settings, nseeds_next)` works in step
+totals: RELACC on the combined error, SCALING on `ntot` ratios, and the next
+step's total statistics is `last.ncall * last.nseeds * fac_increment`. That
+total is split over the `nseeds_next` seeds on offer with a per-seed floor of
+`ncall_start` (fewer seeds are used if the floor would over-shoot the plan);
+the `job_max_runtime` cap is then applied *per seed* from the last step's
+per-seed numbers. A step that a single seed could not finish in time is
+therefore no longer abandoned with RUNTIME as long as enough seeds are
+available. The first step always runs one seed. `size_preproduction` uses the
+per-seed statistics and wall time for the time budget and the step total with
+the combined error for the accuracy cap.
 
 ### `preproduction.py` — steps instead of jobs
 
 - `_queue_job(..., n=1)` creates `n` identical warmup rows in one commit and
   returns the first id.
-- `_warmup_step_size`: 1 when no successful warmup exists (no `.khs` yet),
-  otherwise `min(run.jobs_batch_size, run.jobs_max_concurrent,
-  run.jobs_max_total)` so a step can never out-size the executor pool.
+- `_free_warmup_seeds`: the seeds on offer for the next step, computed from
+  the DB at every step: free executor slots (`min(jobs_max_concurrent,
+  jobs_max_total)` minus the jobs active in this submission) shared evenly
+  among the active parts that have no successful production yet (this part
+  included), at least 1. With 48 parts and 18 slots this is 1 early on; once
+  a few slow parts are left they get the idle cores. The assessment returns
+  the seeds it actually uses (`WarmupRequiredQC.nseeds`), which `_warmup_step`
+  logs (`next warmup step: N seed(s) x NCALL[NITER]`) and queues.
 - `_successful_warmups` returns steps (`list[list[Job]]`), grouped by
   `rel_path` (all seeds of a step share the batch directory), most recent
   first, degenerate rows (`ncall*niter == 0`) excluded.
@@ -161,7 +177,7 @@ No new key. Relevant existing keys:
 |---|---|
 | `warmup.niter` | iterations per seed on the fixed grid; set to 1 for exactly `[1,noadapt]` |
 | `warmup.ncall_start`, `fac_increment`, `min/max_increment_steps`, QC keys | unchanged semantics, now applied per step |
-| `run.jobs_batch_size` | seeds per warmup step. Note: `submit` recomputes it from `jobs_max_concurrent`, `jobs_max_total` and the number of active parts (`__main__.py`, "clamp the batch size"), so with many parts it is small (1 in the 48-part WJunsym test) and it is steered through `--jobs-max-concurrent` |
+| `run.jobs_max_concurrent`, `run.jobs_max_total` | bound the executor pool from which idle slots are handed to warmup steps as extra seeds (`jobs_batch_size` is not used for warmups) |
 
 Grid adaptation now happens once per step instead of once per iteration.
 
@@ -227,11 +243,11 @@ dispatch interval (`0.1 x job_max_runtime`, 180 s here, capped at 300 s)
 `_repopulate` now selects a part with queued jobs and returns `False`, so the
 queued wave is dispatched first; it pauses only once nothing is left to
 dispatch. Verified on eeJJ (600 s runtime, 60 s interval): register-to-submit
-gap 120 s before, 0 s after. Also relevant for utilisation: with `n` active
-parts and `jobs_max_concurrent < n`, `submit` computes `jobs_batch_size = 1`,
-so warmup steps run a single seed; and production dispatch only starts once
-*all* pre-productions are done (`Entry`), which left 14 cores idle for about
-four minutes on this run while the slowest pre-productions finished.
+gap 120 s before, 0 s after. Also relevant for utilisation: production dispatch only
+starts once *all* pre-productions are done (`Entry`), which left 14 cores
+idle for about four minutes on this run while the slowest pre-productions
+finished; with the dynamic seed count the slow parts' late warmup steps now
+use those idle cores instead of running on one.
 
 ## Edge cases
 

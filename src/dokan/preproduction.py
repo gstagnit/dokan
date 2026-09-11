@@ -4,7 +4,7 @@ import luigi
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .db import DBTask, Job, JobStatus
+from .db import DBTask, Job, JobStatus, Part
 from .db._dbdispatch import DBDispatch
 from .db._dbresurrect import DBResurrect
 from .db._loglevel import LogLevel
@@ -125,19 +125,45 @@ class PreProduction(DBTask):
         self._safe_commit(session)
         return JobRef(min(job.id for job in new_jobs))
 
-    def _warmup_step_size(self, past_warmups: list[list[Job]]) -> int:
-        """Number of parallel seeds for the next warmup step.
+    def _free_warmup_seeds(self, session: Session) -> int:
+        """Number of parallel seeds available for this part's next warmup step.
 
-        The first step (no successful warmup yet) must run a single seed: no
-        grid file exists and NNLOJET creates a default one when missing, which
-        parallel seeds sharing a directory would race on.  Later steps use the
-        production batch size (already clamped to the executor pool at submit
-        time; clamp again here so a step can never out-size the pool).
+        The free executor slots (`jobs_max_concurrent` minus the jobs currently
+        active in this submission) are shared evenly among the parts that are
+        still in the warmup phase (active parts without a successful
+        production yet), this part included.  Early in a run with many parts
+        this is 1; once only a few slow parts are left they get the idle
+        cores.  The assessment may use fewer seeds than offered (per-seed
+        floor), and the first step of a part always runs a single seed (it
+        creates the grid file).
         """
-        if not past_warmups:
-            return 1
         run: dict = self.config["run"]
-        return max(1, min(run["jobs_batch_size"], run["jobs_max_concurrent"], run["jobs_max_total"]))
+        pool: int = max(1, min(run["jobs_max_concurrent"], run["jobs_max_total"]))
+        inflight: int = (
+            session.scalar(
+                select(func.count(Job.id))
+                .where(Job.run_tag == self.run_tag)
+                .where(Job.status.in_(JobStatus.active_list()))
+            )
+            or 0
+        )
+        parts_with_production = (
+            select(Job.part_id)
+            .where(Job.mode == ExecutionMode.PRODUCTION)
+            .where(Job.status.in_(JobStatus.success_list()))
+            .distinct()
+        )
+        n_warming: int = (
+            session.scalar(
+                select(func.count(Part.id))
+                .where(Part.active.is_(True))
+                .where(Part.id.not_in(parts_with_production))
+            )
+            or 0
+        )
+        n_others: int = max(0, n_warming - 1)
+        free: int = max(0, pool - inflight)
+        return max(1, min(pool, free // (n_others + 1)))
 
     def _iteration_errors(self, jobs: list[Job]) -> list[float]:
         # > QC measures that require the ExeData information; a job without parsed
@@ -204,10 +230,13 @@ class PreProduction(DBTask):
         callers can size the next step without re-querying.
         """
         past_warmups: list[list[Job]] = self._successful_warmups(session)
+        # > seeds on offer for the next step (the first step is always a single seed)
+        nseeds_next: int = self._free_warmup_seeds(session) if past_warmups else 1
         assessment = assess_warmup(
             past=[combine_warmup_jobs([WarmupJobQC.from_row(job) for job in step]) for step in past_warmups],
             iteration_errors=lambda: self._iteration_errors(past_warmups[0]),
             settings=WarmupSettingsQC.from_config(self.config),
+            nseeds_next=nseeds_next,
         )
         return assessment, past_warmups
 
@@ -217,12 +246,16 @@ class PreProduction(DBTask):
         if active_warmup is not None:
             return JobRef(active_warmup)
 
-        assessment, past_warmups = self._assess_warmup(session)
+        assessment, _ = self._assess_warmup(session)
         if isinstance(assessment, WarmupCompleteQC):
             return assessment
-        return self._queue_job(
-            session, ExecutionMode.WARMUP, assessment.size, self._warmup_step_size(past_warmups)
+        self._logger(
+            session,
+            self._logger_prefix
+            + f"::run:  next warmup step: {assessment.nseeds} seed(s) x "
+            + f"{assessment.size.ncall}[{assessment.size.niter}] [dim]{assessment.flags}[/dim]",
         )
+        return self._queue_job(session, ExecutionMode.WARMUP, assessment.size, assessment.nseeds)
 
     def seed_warmup_restart(self) -> WarmupRestartOutcome:
         """Seed or adopt a warmup restart for this part."""
@@ -235,13 +268,11 @@ class PreProduction(DBTask):
             if active_warmup is not None:
                 return WarmupRestartPending(JobRef(active_warmup))
 
-            assessment, past_warmups = self._assess_warmup(session)
+            assessment, _ = self._assess_warmup(session)
             if isinstance(assessment, WarmupCompleteQC):
                 return assessment
             return WarmupRestartSeeded(
-                self._queue_job(
-                    session, ExecutionMode.WARMUP, assessment.size, self._warmup_step_size(past_warmups)
-                )
+                self._queue_job(session, ExecutionMode.WARMUP, assessment.size, assessment.nseeds)
             )
 
     def _production_step(self, session: Session) -> JobRef | None:
