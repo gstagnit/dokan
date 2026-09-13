@@ -276,8 +276,31 @@ class MergePart(DBMerge):
             pt: Part = session.get_one(Part, self.part_id)
             pt_name: str = self._part_name(self.part_id, session)  # also primes the log-prefix cache
             merge_in_progress = pt.timestamp < 0.0
+            # > Counted before the loop below mutates anything: `_logger` commits the
+            # > session, so reporting afterwards would also commit the status flips.
+            # > `merge_in_progress` is the `timestamp < 0` sentinel.  It is set on the
+            # > *normal* path too -- Luigi restarts run() from the top once the yielded
+            # > MergeObs finish, and that second pass finalises the part -- so the wording
+            # > must not imply a fault; a crashed earlier attempt looks identical here.
+            count_job = (
+                select(func.count())
+                .select_from(Job)
+                .join(Part)
+                .where(Part.id == self.part_id)
+                .where(Part.active.is_(True))
+                .where(Job.mode == ExecutionMode.PRODUCTION)
+            )
+            c_done: int = session.scalar(count_job.where(Job.status == JobStatus.DONE)) or 0
+            c_merged: int = session.scalar(count_job.where(Job.status == JobStatus.MERGED)) or 0
             self._logger(
-                session, self._logger_prefix + "::run: " + ("fresh" if not merge_in_progress else "continue")
+                session,
+                self._logger_prefix
+                + (
+                    f"::run:  continuing in-progress merge of {c_done + c_merged} job(s)"
+                    if merge_in_progress
+                    else f"::run:  merging {c_done} new job(s)"
+                    + (f" ({c_merged} already merged)" if c_merged else "")
+                ),
             )
             pt.Ttot = 0.0
             pt.ntot = 0
@@ -592,12 +615,24 @@ class MergePart(DBMerge):
             raise ValueError(self._logger_prefix + f"::run:  val={cross_result}, err={cross_error}")
         min_rel_err: float = 1e-9
         if rel_cross_err < min_rel_err:
+            # > `rel_cross_err == 0` exactly means `cross` came out 0 +/- 0, i.e. no event of
+            # > this part passed the selection -- an expected outcome for a partonic channel
+            # > that cannot contribute to the requested observable, not a fault.  The floor
+            # > only keeps the optimiser from dividing by zero; the part then carries error 0
+            # > and `_distribute_jobs` leaves it out of the budget, so it gets no further
+            # > jobs.  That is the intended behaviour, but say what it means rather than
+            # > reporting an internal variable, and do not cry WARN about it on every merge.
             with self.session as session:
                 self._logger(
                     session,
                     self._logger_prefix
-                    + f"::run:  very small relative error {rel_cross_err:.3e}, setting to min_rel_err",
-                    level=LogLevel.WARN,
+                    + (
+                        "::run:  no accepted events (cross = 0 +/- 0): nothing to optimise,"
+                        " part excluded from the error budget"
+                        if rel_cross_err == 0.0
+                        else f"::run:  relative error {rel_cross_err:.3e} below the {min_rel_err:.0e}"
+                        " floor, clipped"
+                    ),
                 )
             rel_cross_err = min_rel_err
 

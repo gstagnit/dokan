@@ -352,7 +352,9 @@ class PreProduction(DBTask):
         # > warmup stage
         with self.session as session:
             self._part_name(self.part_id, session)  # prime the log-prefix cache
-            self._logger(session, self._logger_prefix + "::run")
+            # > bare entry marker: it carries no state, and Luigi re-enters run() after
+            # > every yielded warmup step, so at INFO it is pure repetition
+            self._debug(session, self._logger_prefix + "::run")
             step: JobRef | WarmupCompleteQC = self._warmup_step(session)
             if isinstance(step, JobRef):
                 self._logger(

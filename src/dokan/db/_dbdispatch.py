@@ -697,7 +697,17 @@ class DBDispatch(DBTask):
                 else:
                     # > repopulate selected a part but no jobs were found: stop
                     break
-            self._logger(session, self._logger_prefix + "::run:  " + f"yield {len(runners)} DBRunner")
+            # > the empty case is the dispatcher's idle heartbeat, not an event: logging it
+            # > at INFO drowns the board (it is by far the most frequent message otherwise)
+            if runners:
+                njobs: int = sum(len(r.ids) for r in runners)
+                self._logger(
+                    session,
+                    self._logger_prefix
+                    + f"::run:  dispatched {njobs} job(s) in {len(runners)} batch(es)",
+                )
+            else:
+                self._debug(session, self._logger_prefix + "::run:  nothing to dispatch")
 
         # > for dynamic dispatch: yield runners alongside the next dispatcher so
         # > the next wave starts while current runners are still in flight
