@@ -27,6 +27,11 @@ from ._sqla import Job
 # > same however long the job then integrates for.
 _WALLTIME_FLOOR: float = 300.0  # seconds
 
+# > How many recent jobs of the same part and mode feed the per-event time estimate.
+# > Enough to average out the seed-to-seed spread, few enough to track a part whose
+# > cost per event drifts as its grid adapts during warmup.
+_TAU_SAMPLE: int = 8
+
 # > `Executor.exe_logger` writes "[%Y-%m-%d %H:%M:%S](LEVEL): message" in local time
 _EXE_LOG_TIMESTAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 
@@ -154,6 +159,32 @@ class DBRunner(DBTask):
                 )
         return n_unfinished == 0
 
+    def _recent_tau(self, session: Session) -> float | None:
+        """Seconds per event for *this* part in *this* mode, or None without data.
+
+        Size-weighted -- total time over total events, not a mean of per-job ratios --
+        because the estimate is used to predict a large job, so large jobs should
+        dominate it.
+
+        Keyed on the individual part *and* the mode, and neither may be relaxed: the
+        channels inside one contribution differ in cost by orders of magnitude, and a
+        part integrates far more slowly in production than in warmup.  Pooling either
+        makes the estimate worthless -- pooling channels was measured mispredicting by
+        up to a factor 78.
+        """
+        rows = session.execute(
+            select(Job.ncall, Job.niter, Job.elapsed_time)
+            .where(Job.part_id == self.part_id)
+            .where(Job.mode == self.mode)
+            .where(Job.status.in_(JobStatus.success_list()))
+            .where(Job.elapsed_time > 0.0)
+            .order_by(Job.id.desc())
+            .limit(_TAU_SAMPLE)
+        ).all()
+        n_events: int = sum(r.ncall * r.niter for r in rows)
+        t_total: float = sum(r.elapsed_time for r in rows)
+        return t_total / n_events if n_events > 0 and t_total > 0.0 else None
+
     def _prepare_execution(self, exe_data: ExeData) -> None:
         """Prepare the execution directory and ExeData structure.
 
@@ -183,6 +214,9 @@ class DBRunner(DBTask):
                 raise RuntimeError(f"last warmup {LW.id} has no path")
             LW_id: int | None = LW.id if LW else None
             LW_rel_path: str | None = LW.rel_path if LW else None
+            # > per-event time of this part in this mode, for the wall-clock request
+            # > below; read here so the filesystem work still holds no session
+            tau_recent: float | None = self._recent_tau(session)
 
         # > filesystem work: no DB session held
         # > populate ExeData with all necessary information for the Executor
@@ -209,12 +243,35 @@ class DBRunner(DBTask):
         # >
         # > Ask the batch system for more wall time than we intend to use.  The floor
         # > matters for short budgets, where a percentage alone would not cover a fixed
-        # > startup cost.
+        # > startup cost.  This is the *ceiling*: no job ever asks for more.
         margin: float = max(0.0, float(self.config["run"].get("job_max_runtime_margin") or 0.0))
         job_runtime: float = float(self.config["run"]["job_max_runtime"])
-        exe_data["policy_settings"] = {
-            "max_runtime": max(job_runtime * (1.0 + margin), job_runtime + _WALLTIME_FLOOR)
-        }
+        wall_cap: float = max(job_runtime * (1.0 + margin), job_runtime + _WALLTIME_FLOOR)
+
+        # > Below that ceiling, ask for what *this* job is expected to need.  Only the
+        # > expensive contributions are sized to fill `job_max_runtime`: the allocation
+        # > in `_distribute_time` gives a cheap, well-converged part very little time,
+        # > so its jobs finish in a fraction of the budget.  Requesting the ceiling for
+        # > all of them makes every trivial job look like a long one to the scheduler,
+        # > which matches it against fewer slots and queues it behind nothing it
+        # > resembles.  It also couples two decisions that should be free of each
+        # > other: raising `job_max_runtime` -- worth doing, since a longer job gives a
+        # > better-behaved per-job estimate for the contributions with long weight
+        # > tails -- would otherwise inflate the request of every short job with it.
+        # >
+        # > The safety factor absorbs the seed-to-seed spread within one step, which is
+        # > not small (measured: median 1.26x of the batch median, p90 1.76x, tail to
+        # > ~7x).  Replaying two campaigns' completed jobs through this rule, a factor
+        # > of 4 killed none of 5623 while cutting the requested slot-time by a fifth;
+        # > a factor of 2 killed 7.  Set it to 0 to disable the estimate and always
+        # > request the ceiling.
+        safety: float = max(0.0, float(self.config["run"].get("job_runtime_safety_factor") or 0.0))
+        wall_request: float = wall_cap
+        if safety > 0.0 and tau_recent is not None:
+            expected: float = float(self.ncall * self.niter) * tau_recent
+            wall_request = min(wall_cap, expected * safety + _WALLTIME_FLOOR)
+
+        exe_data["policy_settings"] = {"max_runtime": wall_request}
         for k, v in self.config["exe"]["policy_settings"].items():
             if k == f"{str(exe_data['policy']).lower()}_template":
                 exe_data["policy_settings"][k] = str(self._local(v).absolute())

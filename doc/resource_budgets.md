@@ -168,6 +168,73 @@ Raising the margin is cheap insurance; a killed job costs a whole slot and
 produces nothing. Lower it only if the site penalises longer requested runtimes
 in scheduling.
 
+### That ceiling is not what every job should ask for
+
+Only the expensive contributions are actually sized to fill `job_max_runtime`.
+The Euler-Lagrange allocation in `_distribute_time` gives a cheap, well-converged
+part very little time, and `ntot_job` follows the *allocated* time rather than
+the cap — so those jobs finish in a small fraction of it. Median elapsed as a
+fraction of the cap, over one campaign's production jobs:
+
+| LO | V | VV | R | RV | RR |
+|---|---|---|---|---|---|
+| 1.5% | 1.6% | 3.1% | 10% | 32% | 39% |
+
+Requesting the ceiling for all of them made a job that runs for under a minute
+look, to the scheduler, exactly like one that runs for an hour: matched against
+fewer slots and queued behind nothing it resembles. It also coupled two
+decisions that should be independent — raising `job_max_runtime`, which is worth
+doing because a longer job gives a better-behaved per-job estimate for the
+contributions with long weight tails, would drag the request of every trivial
+job up with it.
+
+So the ceiling stays a ceiling, and each job asks for what it is expected to
+need:
+
+```python
+expected = ncall * niter * tau            # tau from this part's recent jobs
+requested = min(wall_cap, expected * job_runtime_safety_factor + _WALLTIME_FLOOR)
+```
+
+`tau` (`DBRunner._recent_tau`) is size-weighted — total time over total events
+across the last `_TAU_SAMPLE` completed jobs, not a mean of per-job ratios —
+because it is used to predict a large job, so large jobs should dominate it.
+
+**It is keyed on the individual part *and* the mode, and neither may be
+relaxed.** Channels inside one contribution differ in cost by orders of
+magnitude, and a part integrates far more slowly in production than in warmup.
+An early version of this analysis pooled channels by contribution and
+mispredicted by up to a factor of 78 — worth remembering before "simplifying"
+the key.
+
+The safety factor absorbs the seed-to-seed spread within a single step, which is
+not small: measured against the batch median, 1.26x typical, 1.76x at p90, with
+a tail to ~7x. Replaying two campaigns' completed jobs through the rule:
+
+| safety | jobs killed that survive today | slot-time requested |
+|---|---|---|
+| 2 | 7 of 5623 | 66% |
+| 3 | 1 of 5623 | 77% |
+| **4** | **0 of 5623** | **80%** |
+| 6 | 0 of 5623 | 84% |
+
+`run.job_runtime_safety_factor` therefore defaults to **4**. Setting it to 0
+disables the estimate and restores the "always request the ceiling" behaviour.
+
+The effect on what gets asked for, per contribution (same campaign, 60 min
+budget, all of them requesting 69 min before):
+
+| LO | V | VV | R | RV | RR |
+|---|---|---|---|---|---|
+| 5.5 min | 7.3 min | 12.6 min | 12.1 min | 69 min | 69 min |
+
+which moves 29% of jobs out of the longest scheduling band into faster ones,
+while the contributions that genuinely need the full budget keep it.
+
+A part with no completed job in that mode yet has no `tau`, and falls back to the
+ceiling — the conservative direction, since over-requesting only costs
+scheduling priority whereas under-requesting kills the job.
+
 Note that a killed job is *wasteful*, not *incorrect*: dokan marks it FAILED,
 excludes it from the budget, adapts the warmup step on the seeds that did come
 back, and carries on — which is why this produces no ERROR or WARN entries and

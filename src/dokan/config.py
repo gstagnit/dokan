@@ -65,6 +65,10 @@ _schema: dict = {
         # > as a fraction of it: the enforced limit is wall time, which also covers
         # > startup and file transfer, while jobs are sized to fill the integration budget
         "job_max_runtime_margin": float,
+        # > multiplier on the *predicted* runtime of a single job when asking the batch
+        # > system for wall time, capped by `job_max_runtime_margin` (<=0: always ask
+        # > for the cap).  Absorbs the seed-to-seed spread within one step.
+        "job_runtime_safety_factor": float,
         "job_fill_max_runtime": bool,  # if we want to exhause the maximum runtime
         "jobs_max_total": int,  # max production jobs per submission (<=0: no limit)
         # > runtime the whole computation may consume, summed over every job of every
