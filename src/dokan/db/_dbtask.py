@@ -683,9 +683,13 @@ class DBTask(Task, metaclass=ABCMeta):
         # > loop until there are no negative time assignments
         accum_t: float = 0.0
         accum_err_sqrtt: float = 0.0
+        accum_t_all: float = 0.0
+        n_included: int = 0
         while True:
             accum_t = 0.0
             accum_err_sqrtt = 0.0
+            accum_t_all = 0.0
+            n_included = 0
             for part_id, ic in cache.items():
                 if part_id not in result["part"]:
                     i_tau: float = ic["sum"] / ic["norm"]
@@ -705,8 +709,14 @@ class DBTask(Task, metaclass=ABCMeta):
                         "i_T": i_t,
                         "i_err_sqrtT": ic["adj_error"] * math.sqrt(i_t),
                     }
+                # > time over *every* part, excluded ones included: the E-L sums below
+                # > drop the excluded parts, but the total time already invested does
+                # > not care which parts the optimiser wants to spend more on, and the
+                # > `T_target` fallback needs it (see the end of this method)
+                accum_t_all += result["part"][part_id]["i_T"]
                 # > skip excluded parts
                 if result["part"][part_id].get("T_opt", 1.0) > 0.0:
+                    n_included += 1
                     accum_t += result["part"][part_id]["i_T"]
                     accum_err_sqrtt += result["part"][part_id]["i_err_sqrtT"]
 
@@ -780,6 +790,32 @@ class DBTask(Task, metaclass=ABCMeta):
             f"{target_abs_acc=}, T_target={result['T_target']}",
         )
         result["T_target"] = max(0.0, result["T_target"])
+
+        # > The estimate above is only meaningful when this call was solving for a
+        # > budget of roughly the right size.  The reporting paths cannot do that --
+        # > they ask for the estimate itself, so they pass a token `total_t` to avoid
+        # > dividing by zero -- and the E-L step then excludes nearly every part,
+        # > since with a one-second budget each already holds more than its share
+        # > (`t_opt = share * (total_t + accum_t) - i_t` goes negative).  `accum_*`
+        # > collapse to the one surviving part and `T_target` reads 0 however far the
+        # > run is from its target.  It also defeats the caller's refinement loop,
+        # > which re-solves only `while T_target / prev_T_target > 1.3`: seeded with
+        # > zero, it never iterates.
+        # >
+        # > Fall back to plain 1/sqrt(T) scaling of the *reported* error over *all*
+        # > parts, which has no such failure mode.  It is an upper bound -- it credits
+        # > nothing to reallocating time between parts -- but a conservative estimate
+        # > is the right kind of wrong here, and it gives the refinement loop a
+        # > sensible seed so the E-L answer takes over on the next pass.
+        if result["T_target"] <= 0.0 and target_abs_acc > 0.0 and result["tot_error"] > target_abs_acc:
+            result["T_target"] = accum_t_all * ((result["tot_error"] / target_abs_acc) ** 2 - 1.0)
+            self._debug(
+                session,
+                "DBTask::_distribute_time:  E-L estimate degenerate "
+                f"({len(result['part']) - n_included} of {len(result['part'])} parts excluded); "
+                f"falling back to 1/sqrt(T) scaling: T_target={result['T_target']}",
+            )
+            result["T_target"] = max(0.0, result["T_target"])
 
         # > split up into jobs
         # (T_max_job, T_job, njobs, ntot_job)

@@ -97,6 +97,46 @@ The consumption figures are two `SUM`/`COUNT` queries.
 `T_target` from a single pass is a first-order estimate — `MergeFinal` iterates
 it to convergence — hence the `~`.
 
+### Why `T_target` used to read zero
+
+The reporting paths cannot solve for the budget they are about to ask for, so
+they call `_distribute_time` with a token one-second `total_t` just to avoid a
+division by zero. That turns out to be a degenerate input. The Euler-Lagrange
+step allocates
+
+```python
+t_opt = (i_err_sqrtt / accum_err_sqrtt) * (total_t + accum_t) - i_t
+```
+
+and with a one-second budget *every* part already holds more than its share, so
+`t_opt` goes negative and the part is excluded. Iterating, almost everything is
+excluded — measured on a finished run: **179 of 180 parts**. `accum_err_sqrtt`
+and `accum_t` then describe a single part, and
+
+```python
+T_target = (accum_err_sqrtt / target_abs_acc) ** 2 - accum_t
+```
+
+comes out negative and clamps to zero. The run reported
+
+```
+reached rel. acc. 28.2% on cross_hist (requested: 10.0%)
+still require about 0 seconds of runtime to reach desired target accuracy
+```
+
+`MergeFinal`'s refinement loop cannot rescue this either: it re-solves only
+`while T_target / prev_T_target > 1.3`, and seeded with zero it never runs.
+
+`_distribute_time` now falls back to plain `1/sqrt(T)` scaling of the *reported*
+error across *all* parts whenever the E-L estimate degenerates to zero while the
+error is still above target. That has no exclusion set to collapse. It is an
+upper bound — it credits nothing to reallocating time between parts — but a
+conservative estimate is the right kind of wrong for a "you still need about X"
+statement, and it gives the refinement loop a sensible seed so the sharper E-L
+answer takes over on the next pass. On the run above it reports ~345 days of
+runtime (~16600 jobs), consistent with the 7.9x more statistics that closing
+28.2% to 10% demands.
+
 ## Bounding a single job
 
 ### `job_max_runtime` is an integration budget, not a wall-clock limit

@@ -46,6 +46,29 @@ the gappy ones. To confirm what a given row is, read the channel definitions out
 of the run's `config.json` under `process.channels` — each carries its
 `part_num` and its `! channel: [a,b]` label.
 
+### Layout
+
+When the terminal is wide enough the board and the log sit side by side, the log
+in a panel to the right of the board. Otherwise the board is drawn alone and log
+records are printed above it, as they always were.
+
+The split exists because the board is as tall as the process has channels — for a
+realistic process that is most of the terminal, leaving a couple of lines above
+it in which a message appears and is immediately pushed out of sight. In the
+panel a whole screenful stays put.
+
+Two consequences worth knowing:
+
+* the panel shows **one line per record**, elided rather than wrapped, so the
+  number of visible records is predictable — a long message is cut, not spread
+  over four lines;
+* records in the panel are *not* in the terminal's scrollback, since they live
+  inside the live region. Nothing is lost: every record is in `log.sqlite`, which
+  is the place to read history from anyway (see the queries below).
+
+The fallback triggers below `board width + 60` columns; a cramped panel is worse
+than none.
+
 ## The log stream
 
 Messages are written to the run's log database and streamed above the board.

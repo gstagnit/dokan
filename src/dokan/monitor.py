@@ -6,13 +6,17 @@ records from the DB in near real-time.
 
 import datetime
 import time
+from collections import deque
 from typing import NamedTuple
 
 from rich import box
-from rich.console import Console
+from rich.columns import Columns
+from rich.console import Console, Group, RenderableType
 from rich.live import Live
+from rich.panel import Panel
 from rich.style import Style
 from rich.table import Column, Table
+from rich.text import Text
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -23,6 +27,15 @@ from .db._sqla import Job
 from .exe import ExecutionMode
 
 _console = Console()
+
+# > How many log records to retain for the side-by-side panel.  Only the last
+# > screenful is ever drawn; the rest is slack so a taller terminal has something
+# > to show.
+_LOG_HISTORY: int = 500
+
+# > Minimum width the log panel needs to be worth having.  Below the board's own
+# > width plus this, the split is dropped and messages go above the board as before.
+_LOG_MIN_WIDTH: int = 60
 
 
 def _part_label(pt: Part) -> str:
@@ -59,6 +72,11 @@ class Monitor(DBTask):
         self._log_id: int = 0
         self.cross_line: str = "[blue]cross = ... (waiting for first update) [/blue]"
         self.cross_time: float = time.time()
+        # > Recent log records, kept for the side-by-side view.  The board is tall
+        # > enough that messages printed above it scroll out of sight almost at once;
+        # > holding them in a panel beside the board keeps the last screenful visible.
+        # > Nothing is lost either way -- every record is in the log database.
+        self._log_lines: deque[str] = deque(maxlen=_LOG_HISTORY)
 
     def _init_board(self, session: Session) -> None:
         """Query the DB once to build the static table layout and the log cursor.
@@ -178,6 +196,42 @@ class Monitor(DBTask):
 
         return table
 
+    def _render(self, table: Table) -> tuple[RenderableType, bool]:
+        """The live renderable, and whether the log is drawn beside the board.
+
+        The board is as tall as the process has channels, which on a real run leaves
+        only a couple of lines between it and the top of the terminal -- so messages
+        printed above it are gone before they can be read.  When the terminal is wide
+        enough, put them in a panel next to the board instead, where a whole screenful
+        stays put.
+
+        Falls back to the board alone (messages printed above it, as before) when the
+        terminal is too narrow to give the panel `_LOG_MIN_WIDTH`; a cramped split is
+        worse than none.
+        """
+        width, height = _console.size
+        board_width: int = _console.measure(table).maximum
+        if width < board_width + _LOG_MIN_WIDTH:
+            return table, False
+
+        log_width: int = width - board_width - 1
+        # > one record per line, elided rather than wrapped: a wrapped record would
+        # > cost several lines and make the number of visible records unpredictable
+        body: list[Text] = []
+        for line in list(self._log_lines)[-max(1, height - 2) :]:
+            text = Text.from_markup(line)
+            text.no_wrap = True
+            text.overflow = "ellipsis"
+            body.append(text)
+        panel = Panel(
+            Group(*body) if body else Text("(waiting for messages)", style="dim"),
+            title="[dim]log[/dim]",
+            title_align="left",
+            border_style="dim",
+            width=log_width,
+        )
+        return Columns([table, panel], padding=(0, 1), expand=False), True
+
     def complete(self) -> bool:
         """Always return False; monitor lifetime is controlled inside `run()`."""
         return False
@@ -193,11 +247,15 @@ class Monitor(DBTask):
             self._logger(session, "Monitor::run:  switching on the job status board...")
             initial_table = self._generate_table(session)
 
-        with Live(initial_table, auto_refresh=False) as live:
+        renderable, _ = self._render(initial_table)
+        with Live(renderable, auto_refresh=False) as live:
             while True:
                 with self.session as session:
-                    live.update(self._generate_table(session), refresh=True)
+                    table = self._generate_table(session)
+                    renderable, split = self._render(table)
+                    live.update(renderable, refresh=True)
 
+                    stop: bool = False
                     for log in session.scalars(
                         select(Log).where(Log.id > self._log_id).order_by(Log.id.asc())
                     ):
@@ -209,9 +267,18 @@ class Monitor(DBTask):
                         dt_str: str = datetime.datetime.fromtimestamp(log.timestamp).strftime(
                             "%Y-%m-%d %H:%M:%S"
                         )
-                        live.console.print(f"[dim][{dt_str}][/dim]({LogLevel(log.level)!r}): {log.message}")
+                        # > a record may be multi-line; the panel shows one line each
+                        for part in f"({LogLevel(log.level)!r}): {log.message}".splitlines():
+                            self._log_lines.append(f"[dim]{dt_str}[/dim] {part}")
+                        if not split:
+                            live.console.print(
+                                f"[dim][{dt_str}][/dim]({LogLevel(log.level)!r}): {log.message}"
+                            )
                         if log.level in [LogLevel.SIG_COMP, LogLevel.SIG_TERM]:
-                            return
-                        # time.sleep(0.01)
+                            stop = True
+                    if stop:
+                        # > redraw so the final records are on screen before returning
+                        live.update(self._render(self._generate_table(session))[0], refresh=True)
+                        return
 
                 time.sleep(self._refresh_delay)
