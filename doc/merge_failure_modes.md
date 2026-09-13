@@ -285,16 +285,29 @@ are simply small now. If the parent is ever seen growing again, `_scheduled_task
 is the first place to look, and the question is what those instances are holding
 rather than how many there are.
 
+### What the fix is worth, measured
+
+Three measurements, all with the shared-config parameter in place:
+
+| | |
+|---|---|
+| parent holding 20 000 retained task instances | **105 MB** (was ~0.9 GB in configs alone) |
+| child forked from that parent, after its own `gc.collect()` | **92 MB** — nearly all shared |
+| same, with `gc.freeze()` before the fork | **91 MB** — no useful gain |
+| RSS across six consecutive merges in one process | **71 → 72 MB**, +25 gc objects each |
+
+The last row is the important one: the merge itself does not accumulate, so the
+parent has no per-merge leak. The growth that made the fan-out dangerous was the
+retained configuration, and it is gone. `gc.freeze()` before `luigi.build` was
+tried and rejected on the evidence — with the copies removed there is nothing
+left for it to protect.
+
+This also settles the `DBTask` pool size, which is still `nactive_part + 2`: it
+was only hazardous because each fork copied a multi-GB parent. Lowering it stays
+rejected — it would throttle the batch-system pollers and slow the whole
+workflow — and `merge_concurrent` remains the specific cap on the one fan-out
+that is both wide and memory-hungry.
+
 ## Open items
 
-Nothing outstanding from the failure modes above. Two things are worth keeping in
-view:
-
-1. **`DBTask` is still sized at `nactive_part + 2`.** The `merge_concurrent` cap
-   bounds the merge fan-out specifically, and a lighter parent makes every fork
-   cheaper, but a large simultaneous fan-out of other `DBTask`s is still possible
-   in principle. Lowering `DBTask` was rejected deliberately: it would also
-   throttle the batch-system pollers and slow the whole workflow.
-2. **`luigi.log` is written by every forked worker in append mode.** Records from
-   different processes interleave; individual writes are small enough to arrive
-   intact, which is all a diagnostic log needs, but it is not a serialized stream.
+Nothing outstanding from the failure modes above.

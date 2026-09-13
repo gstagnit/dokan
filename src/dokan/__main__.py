@@ -70,9 +70,16 @@ def setup_luigi_logging(log_file: Path, console_level: str) -> None:
     the `Monitor` task's live board redraws over it, and nothing keeps a copy.
 
     Claims Luigi's one-shot logging setup so it does not add a second stderr handler on
-    top.  The file is opened in append mode and every forked `TaskProcess` inherits the
-    handler, so records from different processes interleave; individual writes are small
-    enough to arrive intact, which is all a diagnostic log needs.
+    top.
+
+    Only this process writes the file.  Luigi forks a `TaskProcess` per task attempt,
+    and an inherited `FileHandler` would give the run as many concurrent appenders as
+    there are workers, interleaving partial records once a traceback outgrows the
+    stream buffer.  The handler is therefore dropped in every forked child, which
+    loses nothing: the scheduler-level messages worth keeping (task deaths, retry
+    scheduling, resource waits) are emitted by the parent, and a child's own failure
+    is already recorded in the log database by the `Event.FAILURE` handler in
+    `db/_dbtask.py`, traceback included.
     """
     logger = logging.getLogger("luigi-interface")
     marker: str = "dokan-luigi-logfile"
@@ -94,11 +101,22 @@ def setup_luigi_logging(log_file: Path, console_level: str) -> None:
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(
             logging.Formatter(
-                "[%(asctime)s](%(levelname)s) %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+                "[%(asctime)s](%(levelname)s)[%(process)d] %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
             )
         )
         file_handler._dokan = marker  # type: ignore[attr-defined]
         logger.addHandler(file_handler)
+
+        def _drop_in_child() -> None:
+            """Leave the log to the parent: a forked worker must not append to it."""
+            for handler in list(logger.handlers):
+                if getattr(handler, "_dokan", None) == marker:
+                    logger.removeHandler(handler)
+                    handler.close()
+
+        if hasattr(os, "register_at_fork"):  # POSIX only; Luigi workers fork on Linux
+            os.register_at_fork(after_in_child=_drop_in_child)
 
     InterfaceLogging._configured = True
 
