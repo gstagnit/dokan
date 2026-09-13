@@ -5,6 +5,7 @@ backend as specified by the job policy. It is responsible for populating
 the database with the results of each execution.
 """
 
+import datetime
 import re
 import shutil
 from pathlib import Path
@@ -19,6 +20,29 @@ from ._dbmerge import MergePart
 from ._dbtask import DBTask
 from ._jobstatus import JobStatus
 from ._sqla import Job
+
+# > `Executor.exe_logger` writes "[%Y-%m-%d %H:%M:%S](LEVEL): message" in local time
+_EXE_LOG_TIMESTAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+
+
+def _log_line_is_current(line: str, job_start: float) -> bool:
+    """Whether an executor-log line was written by the job that started at `job_start`.
+
+    Lines carrying no parseable timestamp are kept: they are continuations (tracebacks,
+    NNLOJET output) of a line that has one, and dropping them would lose real output.
+    """
+    if job_start <= 0.0:
+        return True
+    match = _EXE_LOG_TIMESTAMP.match(line)
+    if match is None:
+        return True
+    try:
+        stamp: float = datetime.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
+    except ValueError:
+        return True
+    # > the format has one-second granularity: allow that much slack so a line written
+    # > in the same second the job started is not mistaken for an older one
+    return stamp >= job_start - 1.0
 
 
 class DBRunner(DBTask):
@@ -202,6 +226,12 @@ class DBRunner(DBTask):
                 # > skip backup/temporary grid state files left behind by `NNLOJET --adapt`
                 if re.match(r"^.*\.khs\.(bak|new|old)$", wfile):
                     continue
+                # > the previous step's executor log is a record of *that* step, not an
+                # > input to this one.  Copying it forward makes the echo below re-report
+                # > its entries under this job's name -- a warmup `--adapt` line resurfacing
+                # > in a production directory reads as if the grid were still being adapted.
+                if wfile == Executor._file_log:
+                    continue
                 if re.match(r"^job.*$", wfile):
                     continue
                 if self.mode == ExecutionMode.PRODUCTION and re.match(r"^.*\.txt$", wfile):
@@ -231,7 +261,6 @@ class DBRunner(DBTask):
         # > Phase 1: short DB session: resolve context and the batch status
         with self.session as session:
             self._load_context(session)
-            self._logger(session, self._logger_prefix + f"::run:  [dim](job_ids = {self.ids})[/dim]")
             # > DBDispatch takes care to stay within batch size
             db_jobs: list[Job] = [session.get_one(Job, job_id) for job_id in self.ids]
             job_status: JobStatus = JobStatus(db_jobs[0].status)
@@ -240,6 +269,14 @@ class DBRunner(DBTask):
                     self._logger_prefix
                     + f"::run:  mixed statuses in batch: {[(j.id, JobStatus(j.status)) for j in db_jobs]}"
                 )
+            # > state of the batch, not its internal ids: the ids alone say nothing about
+            # > what the runner is waiting for or acting on
+            self._logger(
+                session,
+                self._logger_prefix
+                + f"::run:  batch {self.job_path.name}: {len(db_jobs)} job(s) {job_status!s}"
+                + f" [dim](job_ids = {self.ids})[/dim]",
+            )
 
         # > Phase 2: filesystem I/O (job metadata, runcard, warmup grids) and the
         # > executor yield: no DB session held — a session would not survive the
@@ -261,12 +298,17 @@ class DBRunner(DBTask):
             # > even failed jobs should finalize ExeData
             raise RuntimeError(f"{self.ids} not final?!\n{self.job_path}\n{exe_data.data}")
 
-        # > check if there was an Executor log written out; if yes print it below
+        # > check if there was an Executor log written out; if yes print it below.
+        # > Only entries from this job are reported: a log predating the job's own start
+        # > belongs to an earlier step (one copied in as an input, or a directory reused
+        # > on recovery) and echoing it attributes another step's actions to this one.
+        # > Lines without a parseable timestamp are always kept.
         exe_log: Path = exe_data.path / Executor._file_log
         exe_log_lines: list[str] = []
         if exe_log.exists():
+            job_start: float = float(exe_data.get("timestamp") or 0.0)
             with open(exe_log) as f:
-                exe_log_lines = f.readlines()
+                exe_log_lines = [ln for ln in f.readlines() if _log_line_is_current(ln, job_start)]
 
         # > Phase 3: short DB session: persist results & decide on a re-merge
         mrg_part = None
@@ -288,7 +330,11 @@ class DBRunner(DBTask):
                 if candidate.complete():
                     self._debug(session, self._logger_prefix + "::run:  MergePart skip")
                 else:
-                    self._logger(session, self._logger_prefix + "::run:  yield MergePart")
+                    self._logger(
+                        session,
+                        self._logger_prefix
+                        + f"::run:  {len(self.ids)} job(s) finished -> merging part",
+                    )
                     mrg_part = candidate
         if mrg_part is not None:
             yield mrg_part
