@@ -276,6 +276,12 @@ def main() -> None:
     parser_submit.add_argument("--seed-offset", type=int, help="seed offset")
     parser_submit.add_argument("--local-cores", type=int, help="maximum number of local cores")
     parser_submit.add_argument(
+        "--merge-cores",
+        type=int,
+        help="maximum number of parts merged in parallel (default: min(#cores, 8)); "
+        "lower it if the merge fan-out overruns the available memory",
+    )
+    parser_submit.add_argument(
         "--warmup",
         action=argparse.BooleanOptionalAction,
         help="re-open or skip (`--no-warmup`) the warmup phase",
@@ -1063,6 +1069,13 @@ def main() -> None:
             local_ncores = max(2, args.local_cores)
 
         nworkers: int = max(cpu_count, nactive_part) + 1
+        # > cap the parallel merge fan-out (see `MergePart.resources`).  Luigi forks one
+        # > process per task: letting all `nactive_part` merges run at once copies the
+        # > (late in a run: multi-GB) parent interpreter that many times, which overruns
+        # > a cgroup memory limit and gets the merges OOM-killed mid-HDF5-write.
+        merge_concurrent: int = (
+            max(1, args.merge_cores) if args.merge_cores is not None else max(1, min(cpu_count, 8))
+        )
         # > a single batch is dispatched to one executor that reserves
         # > `jobs_concurrent == njobs` from a pool of size `jobs_max`; clamp the
         # > batch size to `jobs_max` so a batch can never out-size the pool and
@@ -1080,6 +1093,7 @@ def main() -> None:
             config["run"]["jobs_batch_size"] = min(config["run"]["jobs_batch_size"], 1000)
 
         console.print(f"# workers: {nworkers}")
+        console.print(f"# merge cores: {merge_concurrent}")
         console.print(f"# batch size: {config['run']['jobs_batch_size']}")
 
         # > increase limit on #files to accommodate potentially large #workers we spawn
@@ -1102,6 +1116,7 @@ def main() -> None:
                     "jobs_concurrent": jobs_concurrent,
                     "DBTask": nactive_part + 2,
                     "DBDispatch": 1,
+                    "merge_concurrent": merge_concurrent,
                 },
                 cache_task_completion=False,  # needed for MergePart
                 check_complete_on_run=False,
@@ -1246,6 +1261,10 @@ def main() -> None:
                     # @todo allow `-j` flag for user to pick?
                     "local_ncores": local_ncores,
                     "DBTask": cpu_count + 1,
+                    # > cap the merge fan-out here too (see `MergePart.resources`);
+                    # > without the declaration Luigi would default the limit to 1
+                    # > and serialize the per-part merges of `MergeFinal`.
+                    "merge_concurrent": max(1, min(cpu_count, 8)),
                 },
                 cache_task_completion=False,
                 check_complete_on_run=False,

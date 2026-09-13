@@ -40,6 +40,28 @@ from ._loglevel import LogLevel
 from ._sqla import Job, Log, Part
 
 
+# > `raw/<part>.hdf5` is a *derived* cache: every observable in it is rebuilt from
+# > the raw `.dat` job outputs, so an unusable one is always recoverable and must
+# > never fail the part.  A writer killed mid-write (OOM, SIGKILL) leaves two
+# > distinct symptoms, each visible on only one of the two access paths:
+# >
+# >   * a stale SWMR "open for write" flag -- a *reader* opens such a file happily
+# >     (that is what SWMR is for); only the write open in `build_obs_group()`
+# >     rejects it, as `OSError: ... file is already open for write/SWMR write`;
+# >   * a root link table naming objects that lie past the recorded end-of-address
+# >     -- the file and its link table read back fine and the damage surfaces only
+# >     when an object header is actually accessed, as
+# >     `KeyError: ... len not positive after adjustment for EOA`.
+# >
+# > Neither is detectable by a cheap up-front probe without a write open (which
+# > would touch the file's mtime and so its `MergeObs` freshness identity), so both
+# > access paths recover at their point of use instead.
+#
+# > Deliberately narrow: a `ValueError` out of `build_obs_group()` (a binning
+# > mismatch against the runcard, say) is a genuine inconsistency and stays fatal.
+_HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
+
+
 class DBMerge(DBTask, metaclass=ABCMeta):
     # > flag to force a re-merge (if new jobs are in a `done` state but not yet `merged`)
     force: bool = luigi.BoolParameter(default=False)  # type: ignore[assignment]
@@ -64,7 +86,15 @@ class MergePart(DBMerge):
     def resources(self):  # type: ignore
         # return super().resources | {"local_ncores": 1, f"MergePart_{self.part_id}": 1}
         # > merge is I/O-bound (HDF5): skip local_ncores, use DBTask + per-part mutex
-        return {"DBTask": 1, f"MergePart_{self.part_id}": 1}
+        # > `merge_concurrent` additionally caps how many parts stage in parallel.
+        # > Luigi forks one process per task, so an unthrottled fan-out over all parts
+        # > (as happens the moment every pre-production completes) copies the parent
+        # > interpreter `nactive_part` times -- copy-on-write does not save this, since
+        # > CPython touches refcounts across the heap.  A parent that has grown to a few
+        # > GB therefore overruns a per-user memory limit and the merges are OOM-killed --
+        # > leaving behind the damaged staging caches described at `_HDF5_CACHE_ERRORS`
+        # > and, for every affected part, a `retry_delay` (900s) failure loop.
+        return {"DBTask": 1, "merge_concurrent": 1, f"MergePart_{self.part_id}": 1}
 
     # @property
     # def select_part(self):
@@ -169,6 +199,66 @@ class MergePart(DBMerge):
             )
 
         return False
+
+    def _discard_hdf5_cache(self, hdf5_file: Path, exc: BaseException) -> None:
+        """Delete an unusable HDF5 staging cache and say so in the workflow log.
+
+        Safe because the cache is derived data (see `_HDF5_CACHE_ERRORS`) and
+        because the per-part `MergePart_{part_id}` resource makes this task the
+        only writer of `hdf5_file` for the duration.
+        """
+        hdf5_file.unlink(missing_ok=True)
+        self._flush_logs(
+            [
+                (
+                    self._logger_prefix
+                    + f"::run:  unusable HDF5 staging cache ({type(exc).__name__}: {exc});"
+                    + " discarded, rebuilding from raw job output",
+                    LogLevel.WARN,
+                )
+            ]
+        )
+
+    def _stage_histograms(
+        self,
+        hdf5_file: Path,
+        pt_name: str,
+        in_files: dict[str, list[GenericPath]],
+        *,
+        single_file: str | None,
+        merge_in_progress: bool,
+    ) -> None:
+        """Ingest `in_files` into the part's HDF5 group, healing an unusable cache.
+
+        Retried exactly once, on a freshly created file: if the rebuild fails the
+        same way the fault is not the cache, and the error must reach the caller.
+        """
+        try:
+            build_obs_group(
+                hdf5_file,
+                pt_name,
+                in_files,
+                self.config["run"]["histograms"],
+                self._path,
+                single_file=single_file,
+                merge_in_progress=merge_in_progress,
+            )
+        except _HDF5_CACHE_ERRORS as e:
+            if not hdf5_file.is_file():
+                raise  # > nothing to discard: the fault is elsewhere
+            self._discard_hdf5_cache(hdf5_file, e)
+            build_obs_group(
+                hdf5_file,
+                pt_name,
+                in_files,
+                self.config["run"]["histograms"],
+                self._path,
+                # > never skip an observable flagged mid-merge: on the recreated file
+                # > nothing is flagged, and if anything were, skipping it is exactly the
+                # > empty-group outcome this rebuild exists to avoid
+                merge_in_progress=True,
+                single_file=single_file,
+            )
 
     def run(self):  # type: ignore[override]
         # Luigi restarts run() from the top after dynamic dependencies yielded
@@ -285,15 +375,23 @@ class MergePart(DBMerge):
         hdf5_obs_ready: set[str] = set()
         hdf5_obs_files: dict[str, set[GenericPath]] = {}
         if merge_in_progress and hdf5_file.is_file():
-            with h5py.File(hdf5_file, "r", libver="latest", swmr=True) as h5f:
-                if pt_name in h5f:
-                    for obs in self.config["run"]["histograms"]:
-                        if obs in h5f[pt_name] and "data" in h5f[pt_name][obs]:
-                            h5grp = h5f[pt_name][obs]
-                            nv = int(h5grp.attrs.get("ndat_valid", h5grp["data"].shape[2]))
-                            if nv > 0:
-                                hdf5_obs_ready.add(obs)
-                                hdf5_obs_files[obs] = set(h5grp["files"].asstr()[:nv])
+            try:
+                with h5py.File(hdf5_file, "r", libver="latest", swmr=True) as h5f:
+                    if pt_name in h5f:
+                        for obs in self.config["run"]["histograms"]:
+                            if obs in h5f[pt_name] and "data" in h5f[pt_name][obs]:
+                                h5grp = h5f[pt_name][obs]
+                                nv = int(h5grp.attrs.get("ndat_valid", h5grp["data"].shape[2]))
+                                if nv > 0:
+                                    hdf5_obs_ready.add(obs)
+                                    hdf5_obs_files[obs] = set(h5grp["files"].asstr()[:nv])
+            except _HDF5_CACHE_ERRORS as e:
+                # > see `_HDF5_CACHE_ERRORS`: derived data, so discard and re-ingest
+                # > rather than fail.  This read happens *before* the ingest that
+                # > would repair the file, so propagating would wedge the part on
+                # > every retry and every later run.
+                self._discard_hdf5_cache(hdf5_file, e)
+                hdf5_obs_ready, hdf5_obs_files = set(), {}
 
         # > single-file histogram output: every observable is fed by the same job files
         obs_in_files: dict[str, list[GenericPath]] = (
@@ -317,12 +415,10 @@ class MergePart(DBMerge):
                 self._safe_commit(session)
         if not resume_hdf5:
             try:
-                build_obs_group(
+                self._stage_histograms(
                     hdf5_file,
                     pt_name,
                     in_files,
-                    self.config["run"]["histograms"],
-                    self._path,
                     single_file=single_file,
                     merge_in_progress=merge_in_progress,
                 )
