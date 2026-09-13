@@ -60,7 +60,11 @@ _schema: dict = {
         "order": Order,  # what order to compute (LO, NLO, NNLO)
         "opt_target": str,  # the target we wish to optimise: ["cross"|"cross_hist"|"hist"]
         "target_rel_acc": float,  # target relative accuracy
-        "job_max_runtime": float,  # maximum runtime (in sec) for a single NNLOJET run
+        "job_max_runtime": float,  # integration-time budget (in sec) for a single NNLOJET run
+        # > extra wall clock requested from the batch system on top of `job_max_runtime`,
+        # > as a fraction of it: the enforced limit is wall time, which also covers
+        # > startup and file transfer, while jobs are sized to fill the integration budget
+        "job_max_runtime_margin": float,
         "job_fill_max_runtime": bool,  # if we want to exhause the maximum runtime
         "jobs_max_total": int,  # max production jobs per submission (<=0: no limit)
         # > runtime the whole computation may consume, summed over every job of every

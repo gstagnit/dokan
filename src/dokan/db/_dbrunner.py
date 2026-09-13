@@ -21,6 +21,12 @@ from ._dbtask import DBTask
 from ._jobstatus import JobStatus
 from ._sqla import Job
 
+# > Smallest wall-clock allowance added on top of `job_max_runtime`, whatever the
+# > relative margin works out to.  A percentage alone is not enough for a short
+# > integration budget: NNLOJET's startup and PDF initialisation cost roughly the
+# > same however long the job then integrates for.
+_WALLTIME_FLOOR: float = 300.0  # seconds
+
 # > `Executor.exe_logger` writes "[%Y-%m-%d %H:%M:%S](LEVEL): message" in local time
 _EXE_LOG_TIMESTAMP = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
 
@@ -186,7 +192,29 @@ class DBRunner(DBTask):
         exe_data["part_id"] = self.part_id
 
         # > add policy settings
-        exe_data["policy_settings"] = {"max_runtime": self.config["run"]["job_max_runtime"]}
+        #
+        # > `job_max_runtime` is dokan's *integration* budget: `assess_warmup` /
+        # > `size_preproduction` pick `ncall` so a job fills it.  What the batch system
+        # > enforces is *wall* time, which additionally covers NNLOJET's startup, the
+        # > PDF initialisation and the input/output transfer -- so handing it the bare
+        # > integration budget leaves a job that used its whole budget no room at all,
+        # > and it is killed with everything it produced discarded.
+        # >
+        # > That is not a rare edge: the sizing aims at the cap, so a healthy run puts
+        # > jobs right underneath it.  Nor does the existing `tau_buf` protect against
+        # > it -- that buffer scales with the *error on the mean* per-event time, which
+        # > shrinks as statistics accumulate, while the spread between seeds of the same
+        # > step does not.  The buffer is therefore smallest exactly where the runtime
+        # > is best measured, which is where jobs graze the limit.
+        # >
+        # > Ask the batch system for more wall time than we intend to use.  The floor
+        # > matters for short budgets, where a percentage alone would not cover a fixed
+        # > startup cost.
+        margin: float = max(0.0, float(self.config["run"].get("job_max_runtime_margin") or 0.0))
+        job_runtime: float = float(self.config["run"]["job_max_runtime"])
+        exe_data["policy_settings"] = {
+            "max_runtime": max(job_runtime * (1.0 + margin), job_runtime + _WALLTIME_FLOOR)
+        }
         for k, v in self.config["exe"]["policy_settings"].items():
             if k == f"{str(exe_data['policy']).lower()}_template":
                 exe_data["policy_settings"][k] = str(self._local(v).absolute())

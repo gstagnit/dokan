@@ -9,6 +9,7 @@
     "opt_target": "cross_hist",
     "target_rel_acc": 0.01,
     "job_max_runtime": 4200,
+    "job_max_runtime_margin": 0.15,
     "job_fill_max_runtime": false,
     "jobs_max_total": 100,
     "jobs_max_concurrent": 10,
