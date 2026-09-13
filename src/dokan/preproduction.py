@@ -138,7 +138,14 @@ class PreProduction(DBTask):
         creates the grid file).
         """
         run: dict = self.config["run"]
-        pool: int = max(1, min(run["jobs_max_concurrent"], run["jobs_max_total"]))
+        # > `jobs_max_total <= 0` means the job count is unlimited, so it must not
+        # > enter this `min()` -- the executor pool is then bounded by concurrency alone
+        pool: int = max(
+            1,
+            min(run["jobs_max_concurrent"], run["jobs_max_total"])
+            if run["jobs_max_total"] > 0
+            else run["jobs_max_concurrent"],
+        )
         inflight: int = (
             session.scalar(
                 select(func.count(Job.id))

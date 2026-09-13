@@ -62,7 +62,11 @@ _schema: dict = {
         "target_rel_acc": float,  # target relative accuracy
         "job_max_runtime": float,  # maximum runtime (in sec) for a single NNLOJET run
         "job_fill_max_runtime": bool,  # if we want to exhause the maximum runtime
-        "jobs_max_total": int,  # maximum number of total (production?) jobs
+        "jobs_max_total": int,  # max production jobs per submission (<=0: no limit)
+        # > runtime the whole computation may consume, summed over every job of every
+        # > submission, warmup included (<=0: derived as `jobs_max_total *
+        # > job_max_runtime`, or unlimited when the job count is unlimited too)
+        "jobs_max_total_runtime": float,
         "jobs_max_concurrent": int,  # maximum number of concurrent jobs
         "jobs_batch_size": int,  # size of runs to batch into a single submission
         "jobs_batch_unit_size": int,  # the minimum batch size of a submission

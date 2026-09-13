@@ -50,7 +50,7 @@ from .preproduction import (
 )
 from .runcard import Runcard, RuncardTemplate
 from .scheduler import WorkerSchedulerFactory
-from .util import parse_time_interval
+from .util import format_time_interval, parse_time_interval
 
 
 # > Luigi's console verbosity (its own scale, not dokan's `ui.log_level`): the live
@@ -340,6 +340,12 @@ def main() -> None:
         "--job-max-runtime", type=parse_time_interval, help="maximum runtime for a single job"
     )
     parser_submit.add_argument("--jobs-max-total", type=int, help="maximum number of jobs")
+    parser_submit.add_argument(
+        "--jobs-max-total-runtime", type=parse_time_interval, metavar="TIME",
+        help="runtime the whole computation may consume, summed over every job of every "
+        "submission and including warmup, with optional units (e.g. \"30000h\"); "
+        "0 derives it from jobs-max-total x job-max-runtime",
+    )
     parser_submit.add_argument(
         "--jobs-max-concurrent", type=int, help="maximum number of concurrently running jobs"
     )
@@ -658,6 +664,7 @@ def main() -> None:
                             "target_rel_acc",
                             "job_max_runtime",
                             "jobs_max_total",
+                            "jobs_max_total_runtime",
                             "jobs_max_concurrent",
                         ]:
                             continue
@@ -744,6 +751,18 @@ def main() -> None:
             console.print("please enter a non-negative value")
         config["run"]["jobs_max_total"] = new_jobs_max_total
         console.print(f"[dim]jobs_max_total = {config['run']['jobs_max_total']!r}[/dim]")
+
+        new_total_runtime: float = TimeIntervalPrompt.ask(
+            "total runtime budget for the whole computation (0 = derive from the job count)",
+            default=float(config["run"].get("jobs_max_total_runtime") or 0.0),
+        )
+        config["run"]["jobs_max_total_runtime"] = max(0.0, new_total_runtime)
+        console.print(
+            "[dim]jobs_max_total_runtime = "
+            f"{format_time_interval(config['run']['jobs_max_total_runtime'])}[/dim]"
+            if config["run"]["jobs_max_total_runtime"] > 0.0
+            else "[dim]jobs_max_total_runtime = 0 (derived from the job count)[/dim]"
+        )
 
         max_concurrent_msg: str
         max_concurrent_def: int
@@ -856,6 +875,8 @@ def main() -> None:
                     config["run"]["job_max_runtime"] = args.job_max_runtime
                 if args.jobs_max_total is not None:
                     config["run"]["jobs_max_total"] = args.jobs_max_total
+                if args.jobs_max_total_runtime is not None:
+                    config["run"]["jobs_max_total_runtime"] = args.jobs_max_total_runtime
                 if args.jobs_max_concurrent is not None:
                     config["run"]["jobs_max_concurrent"] = args.jobs_max_concurrent
                 if args.seed_offset is not None:
@@ -1125,7 +1146,22 @@ def main() -> None:
                     )
 
         # > determine resources and dynamic job settings
-        jobs_max: int = min(config["run"]["jobs_max_concurrent"], config["run"]["jobs_max_total"])
+        # > `jobs_max_total <= 0` lifts the count cap, so it must not be folded into a
+        # > `min()` that sizes pools and batches -- fall back to the concurrency limit
+        n_cap_cfg: int = config["run"]["jobs_max_total"]
+        t_cap_cfg: float = float(config["run"].get("jobs_max_total_runtime") or 0.0)
+        if n_cap_cfg <= 0 and t_cap_cfg <= 0.0:
+            sys.exit(
+                "both jobs_max_total and jobs_max_total_runtime are unlimited: the run "
+                "would have no termination condition.  The accuracy target is not one -- "
+                "an error estimate can rise as statistics arrive.  Set at least one of "
+                "--jobs-max-total / --jobs-max-total-runtime."
+            )
+        jobs_max: int = (
+            min(config["run"]["jobs_max_concurrent"], n_cap_cfg)
+            if n_cap_cfg > 0
+            else config["run"]["jobs_max_concurrent"]
+        )
         # > a resurrected cluster batch claims `jobs_concurrent == njobs` for its
         # > *entire* original batch (the executor sizes itself from
         # > `len(ExeData["jobs"])`, including batch members that already
@@ -1174,6 +1210,16 @@ def main() -> None:
 
         console.print(f"# workers: {nworkers}")
         console.print(f"# merge cores: {merge_concurrent}")
+        console.print(
+            "# job budget: "
+            + (f"{n_cap_cfg} jobs/submission" if n_cap_cfg > 0 else "unlimited jobs")
+            + "   runtime budget: "
+            + (
+                format_time_interval(t_cap_cfg)
+                if t_cap_cfg > 0.0
+                else f"{format_time_interval(n_cap_cfg * config['run']['job_max_runtime'])} (derived)"
+            )
+        )
         console.print(f"# batch size: {config['run']['jobs_batch_size']}")
 
         # > Luigi's own log survives the run here.  The console level mirrors the

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import luigi
 from rich.console import Console
-from sqlalchemy import Engine, create_engine, event, select
+from sqlalchemy import Engine, create_engine, event, func, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session  # , scoped_session, sessionmaker
 
@@ -446,21 +446,90 @@ class DBTask(Task, metaclass=ABCMeta):
 
         self._safe_commit(session)
 
-    def _remainders(self, session: Session) -> tuple[int, float]:
-        # > remaining resources available
-        alloc_jobs = session.scalars(  # active contains time estimates
-            select(Job)
-            .join(Part)
-            .where(Part.active.is_(True))
-            .where(Job.run_tag == self.run_tag)
-            .where(Job.mode == ExecutionMode.PRODUCTION)
-            .where(Job.status.in_(JobStatus.success_list() + JobStatus.active_list()))
-        ).all()
-        njobs_alloc: int = len(alloc_jobs)
-        njobs_rem: int = self.config["run"]["jobs_max_total"] - njobs_alloc
-        t_alloc: float = sum(job.elapsed_time for job in alloc_jobs)
-        t_rem: float = self.config["run"]["jobs_max_total"] * self.config["run"]["job_max_runtime"] - t_alloc
-        return njobs_rem, t_rem
+    def budget(self) -> tuple[float, float, bool]:
+        """`(job cap, runtime cap, runtime cap was set explicitly)`; `inf` = no cap.
+
+        `jobs_max_total <= 0` lifts the limit on the number of jobs.
+        `jobs_max_total_runtime <= 0` falls back to the historical *derived* cap,
+        `jobs_max_total * job_max_runtime`, and leaves the runtime unlimited when
+        the job count is unlimited too -- which is why `submit` refuses to start
+        with both lifted: the accuracy target is not a termination condition, since
+        an error estimate can rise as statistics arrive.
+
+        The third element matters because the two caps are not measured against the
+        same thing (see `_remainders`): the derived cap is an upper bound on what
+        *this submission's* production jobs could consume, whereas an explicit cap
+        is a budget for the whole campaign.  Pairing either with the other's
+        accounting would be a category error -- a resubmit would inherit spend
+        against a cap that had just reset.
+        """
+        run = self.config["run"]
+        n_cap: float = float(run["jobs_max_total"]) if run["jobs_max_total"] > 0 else math.inf
+        t_explicit: float = float(run.get("jobs_max_total_runtime") or 0.0)
+        if t_explicit > 0.0:
+            return n_cap, t_explicit, True
+        return n_cap, n_cap * run["job_max_runtime"], False  # `inf * x` stays inf
+
+    def budget_used(self, session: Session) -> tuple[int, float, float]:
+        """`(jobs this submission, runtime this submission, runtime overall)`.
+
+        The two accountings answer different questions and are deliberately not
+        the same query:
+
+        * the **job count** is per submission, because it is a queue-load guard --
+          a resubmit is meant to be able to dispatch again;
+        * the **runtime** covers every job of every submission *and* both modes,
+          because it bounds the campaign.  Warmup is not a rounding error here --
+          it can be a substantial fraction of everything a run consumes -- so
+          leaving it out would let the true cost drift far past the cap.
+        """
+        alive = JobStatus.success_list() + JobStatus.active_list()
+        njobs_sub: int = (
+            session.scalar(
+                select(func.count())
+                .select_from(Job)
+                .join(Part)
+                .where(Part.active.is_(True))
+                .where(Job.run_tag == self.run_tag)
+                .where(Job.mode == ExecutionMode.PRODUCTION)
+                .where(Job.status.in_(alive))
+            )
+            or 0
+        )
+        t_sub: float = float(
+            session.scalar(
+                select(func.coalesce(func.sum(Job.elapsed_time), 0.0))
+                .select_from(Job)
+                .join(Part)
+                .where(Part.active.is_(True))
+                .where(Job.run_tag == self.run_tag)
+                .where(Job.mode == ExecutionMode.PRODUCTION)
+                .where(Job.status.in_(alive))
+            )
+            or 0.0
+        )
+        t_all: float = float(
+            session.scalar(
+                select(func.coalesce(func.sum(Job.elapsed_time), 0.0))
+                .select_from(Job)
+                .join(Part)
+                .where(Part.active.is_(True))
+                .where(Job.status.in_(alive))
+            )
+            or 0.0
+        )
+        return njobs_sub, t_sub, t_all
+
+    def _remainders(self, session: Session) -> tuple[float, float]:
+        """Head-room left on each cap; `math.inf` when that cap is lifted.
+
+        Each cap is measured against the accounting it was designed for (see
+        `budget`): the derived cap against this submission's production jobs, an
+        explicit campaign budget against every job of every submission.
+        """
+        n_cap, t_cap, t_explicit = self.budget()
+        njobs_sub, t_sub, t_all = self.budget_used(session)
+        return n_cap - njobs_sub, t_cap - (t_all if t_explicit else t_sub)
 
     # @todo make return a UserDict class with a schema?
     def _distribute_time(self, session: Session, total_t: float) -> dict:

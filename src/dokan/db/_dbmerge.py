@@ -822,6 +822,40 @@ class MergeAll(DBMerge):
                 abs(opt_dist["tot_error"] / opt_dist["tot_result"]) if opt_dist["tot_result"] != 0.0 else 0.0
             )
 
+            # > Budget consumption and the runtime still wanted, reported next to the
+            # > accuracy.  `_distribute_time` already yields `T_target` (the E-L estimate
+            # > of the runtime needed to reach the target), and `MergeFinal` already
+            # > prints it -- but only once the run is over, which is far too late to act
+            # > on.  Reporting it here turns an epitaph into a forecast: a target that
+            # > cannot be reached within the remaining budget says so while there is
+            # > still a decision to make.  `T_target` from a single pass is a
+            # > first-order estimate (MergeFinal iterates it), hence the "~".
+            n_cap, t_cap, t_explicit = self.budget()
+            n_used, t_sub, t_all = self.budget_used(session)
+            t_used = t_all if t_explicit else t_sub
+            budget_line: str = "\n[dim]budget: " + (
+                f"{format_time_interval(t_used)} / {format_time_interval(t_cap)} runtime"
+                if math.isfinite(t_cap)
+                else f"{format_time_interval(t_used)} runtime (no cap)"
+            )
+            budget_line += (
+                f"  ·  {n_used} / {int(n_cap)} jobs"
+                if math.isfinite(n_cap)
+                else f"  ·  {n_used} jobs (no cap)"
+            )
+            t_need: float = max(0.0, float(opt_dist.get("T_target") or 0.0))
+            if t_need > 0.0:
+                budget_line += f"\nstill need ~{format_time_interval(t_need)}"
+                if math.isfinite(t_cap):
+                    t_left: float = max(0.0, t_cap - t_used)
+                    budget_line += (
+                        f" of {format_time_interval(t_left)} left"
+                        if t_need <= t_left
+                        else f" but only {format_time_interval(t_left)} left"
+                        + " [red]-> target not reachable within budget[/red]"
+                    )
+            budget_line += "[/dim]"
+
         # > Phase 2: filesystem I/O (collect & accumulate part files): no DB session
         # > held; log messages produced here are deferred to the next session
         deferred_logs: list[tuple[str, LogLevel]] = []
@@ -877,7 +911,8 @@ class MergeAll(DBMerge):
                                 f"[blue]cross = {res} fb[/blue]\n"
                                 + f'[magenta][dim]current "{opt_target}" error:[/dim]\n'
                                 + f"{opt_target_rel * 1e2:.3}%"
-                                + f" (requested: {self.config['run']['target_rel_acc'] * 1e2:.3}%)[/magenta]",
+                                + f" (requested: {self.config['run']['target_rel_acc'] * 1e2:.3}%)[/magenta]"
+                                + budget_line,
                                 LogLevel.SIG_UPDXS,
                             )
                         )
