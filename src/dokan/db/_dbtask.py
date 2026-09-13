@@ -2,9 +2,11 @@ import datetime
 import math
 import os
 import time
+import traceback
 from abc import ABCMeta, abstractmethod
 from enum import Enum
 from functools import partial
+from pathlib import Path
 
 import luigi
 from rich.console import Console
@@ -762,3 +764,99 @@ class DBTask(Task, metaclass=ABCMeta):
         result["tot_error_estimate_jobs"] = math.sqrt(result["tot_error_estimate_jobs"])
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# > Failure reporting
+# ---------------------------------------------------------------------------
+# > Luigi reports task failures through the `luigi` logger (stderr).  In a dokan
+# > run that output is effectively invisible:
+# >
+# >   * every task attempt runs in its own forked `TaskProcess`, while the
+# >     `rich.Live` status board lives only in the `Monitor` task's process, so a
+# >     worker's traceback races with the board's redraw on the shared terminal
+# >     and is overwritten;
+# >   * `luigi.build(..., log_level="WARNING")` additionally suppresses Luigi's
+# >     INFO-level notices, including "Task ... died unexpectedly with exit code".
+# >
+# > The log database is the only channel every process shares, and `Monitor`
+# > already streams it to the board, so failures have to land *there* to be seen
+# > at all -- and to remain readable after the run.  The handlers below are
+# > registered on the dokan `Task` base (not `DBTask`): `MergeObs` is a plain
+# > `Task` -- deliberately DB-free so the standalone `nnlojet-merge` tool can use
+# > it -- and its failures matter just as much.
+_MAX_LOG_MESSAGE: int = 4000
+
+
+def _task_label(task) -> str:
+    """Best-effort human label for `task`, safe to call from a failure handler."""
+    try:
+        return str(getattr(task, "_logger_prefix", None) or task)
+    except Exception:
+        return type(task).__name__
+
+
+def _log_failure(task, message: str) -> None:
+    """Append `message` to the run's log database at ERROR level.  Never raises.
+
+    Luigi triggers `Event.FAILURE` from inside its own ``except`` block
+    (``TaskProcess._handle_run_exception``); an exception escaping here would
+    replace the original failure with this one and leave the worker's result
+    handling in an inconsistent state.  Every error is therefore swallowed, with
+    the console as the last-resort sink.
+    """
+    try:
+        if len(message) > _MAX_LOG_MESSAGE:
+            # > keep the tail: the raising frame is the informative end of a traceback
+            message = "...(truncated)...\n" + message[-_MAX_LOG_MESSAGE:]
+        # > `logname` exists on DBTask; derive it from the run path for plain Tasks
+        logname: str = getattr(task, "logname", "") or (
+            "sqlite:///" + str((Path(task.config["run"]["path"]) / "log.sqlite").absolute())
+        )
+        with Session(bind=_cached_engine(logname, _DBRole.LOG)) as session:
+            session.add(Log(level=LogLevel.ERROR, timestamp=time.time(), message=message))
+            session.commit()
+    except Exception:
+        try:
+            _console.print(f"[red]{message}[/red]")
+        except Exception:
+            pass
+
+
+@Task.event_handler(luigi.Event.FAILURE)
+def _on_task_failure(task, exception) -> None:
+    """Record a task exception, with traceback, in the workflow log."""
+    _log_failure(
+        task,
+        f"{_task_label(task)}::FAILURE:  "
+        + "".join(
+            traceback.format_exception(type(exception), exception, exception.__traceback__)
+        ).rstrip(),
+    )
+
+
+@Task.event_handler(luigi.Event.PROCESS_FAILURE)
+def _on_task_process_failure(task, error_msg) -> None:
+    """Record a hard worker death: OOM kill, segfault, ...
+
+    No Python exception exists for these -- the forked `TaskProcess` was killed
+    outright -- so `Event.FAILURE` never fires and this is the only notification.
+    A burst of these is the signature of the run overrunning a memory limit.
+    """
+    _log_failure(task, f"{_task_label(task)}::PROCESS_FAILURE:  {error_msg}")
+
+
+@Task.event_handler(luigi.Event.BROKEN_TASK)
+def _on_broken_task(task, exception) -> None:
+    """Record a task that could not even be scheduled.
+
+    Raised out of `Task.complete()`/`requires()` while the scheduler walks the
+    dependency graph, i.e. before any `run()` is attempted.
+    """
+    _log_failure(
+        task,
+        f"{_task_label(task)}::BROKEN_TASK:  "
+        + "".join(
+            traceback.format_exception(type(exception), exception, exception.__traceback__)
+        ).rstrip(),
+    )
