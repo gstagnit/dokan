@@ -22,6 +22,29 @@ from ._exe_config import ExecutionMode, ExecutionPolicy
 from ._exe_data import ExeData
 
 
+class LogLevelParameter(luigi.OptionalIntParameter):
+    """An `OptionalIntParameter` that survives a round-trip through `LogLevel`.
+
+    `LogLevel` is an `IntEnum` whose `__str__` returns the lowercase member name, so
+    the inherited `serialize()` renders `LogLevel.INFO` as "info" -- which the
+    inherited `parse()` then rejects with
+    `ValueError: invalid literal for int() with base 10: 'info'`.
+
+    That matters because Luigi serializes a dynamic dependency only when it is *not*
+    already complete (`worker.Worker._run_get_new_deps`), and reconstructs it in the
+    parent with `load_task()`.  An `Executor` yielded for work that still has to run
+    therefore crashes the whole workflow, while one whose outputs are already in
+    place is resolved inline and never exercises the round-trip -- so the fault
+    surfaces on a fresh run and can stay hidden in a resumed one.
+
+    Serializing the underlying integer keeps `parse()` symmetric; `Config` coerces
+    the value back to `LogLevel` where it is read from the configuration.
+    """
+
+    def serialize(self, x) -> str:
+        return "" if x is None else str(int(x))
+
+
 class Executor(luigi.Task, metaclass=ABCMeta):
     """Abstract base class for NNLOJET execution tasks.
 
@@ -45,7 +68,7 @@ class Executor(luigi.Task, metaclass=ABCMeta):
     FS_DELAY: ClassVar[float] = 1.0
 
     path: str = luigi.Parameter()  # type: ignore[assignment]
-    log_level: LogLevel = luigi.OptionalIntParameter(default=LogLevel.INFO)  # type: ignore[assignment]
+    log_level: LogLevel = LogLevelParameter(default=LogLevel.INFO)  # type: ignore[assignment]
     priority_bump: int = luigi.IntParameter(default=0)  # type: ignore[assignment]
 
     _priority_default: ClassVar[int] = 100
