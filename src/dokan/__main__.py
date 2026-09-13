@@ -8,6 +8,7 @@ This module defines:
 
 # from luigi.execution_summary import LuigiRunResult
 import argparse
+import logging
 import multiprocessing
 import os
 import re
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import cast
 
 import luigi
+from luigi.setup_logging import InterfaceLogging
 from rich.console import Console
 from rich.prompt import Confirm, FloatPrompt, IntPrompt, InvalidResponse, Prompt, PromptBase
 from rich.syntax import Syntax
@@ -49,6 +51,56 @@ from .preproduction import (
 from .runcard import Runcard, RuncardTemplate
 from .scheduler import WorkerSchedulerFactory
 from .util import parse_time_interval
+
+
+# > Luigi's console verbosity (its own scale, not dokan's `ui.log_level`): the live
+# > board owns the terminal, so anything below WARNING is unreadable there anyway --
+# > `setup_luigi_logging` keeps the full INFO stream in `luigi.log` instead.
+_LUIGI_CONSOLE_LEVEL: str = "WARNING"
+
+
+def setup_luigi_logging(log_file: Path, console_level: str) -> None:
+    """Keep Luigi's own log in `log_file` at INFO, leaving the console at `console_level`.
+
+    Luigi otherwise configures `luigi-interface` itself: one stderr handler, and the
+    *logger* level set to `log_level`, which discards INFO records before any handler
+    sees them.  Both halves are a problem here.  Its scheduler-level messages ("Task ...
+    died unexpectedly with exit code ...", retry scheduling, resource waits) are exactly
+    what one wants after a stalled run, and stderr is the one place they cannot survive:
+    the `Monitor` task's live board redraws over it, and nothing keeps a copy.
+
+    Claims Luigi's one-shot logging setup so it does not add a second stderr handler on
+    top.  The file is opened in append mode and every forked `TaskProcess` inherits the
+    handler, so records from different processes interleave; individual writes are small
+    enough to arrive intact, which is all a diagnostic log needs.
+    """
+    logger = logging.getLogger("luigi-interface")
+    marker: str = "dokan-luigi-logfile"
+    if any(getattr(handler, "_dokan", None) == marker for handler in logger.handlers):
+        return  # > already set up in this process
+
+    logger.setLevel(logging.INFO)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(getattr(logging, console_level.upper(), logging.WARNING))
+    stream_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    logger.addHandler(stream_handler)
+
+    try:
+        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+    except OSError as err:
+        Console().print(f"[yellow]could not open {log_file}: {err}[/yellow]")
+    else:
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(
+            logging.Formatter(
+                "[%(asctime)s](%(levelname)s) %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            )
+        )
+        file_handler._dokan = marker  # type: ignore[attr-defined]
+        logger.addHandler(file_handler)
+
+    InterfaceLogging._configured = True
 
 
 def reset_and_exit(sig: int, frame) -> None:
@@ -887,6 +939,16 @@ def main() -> None:
                     session.delete(job)
             db_init._safe_commit(session)
 
+        # > `MergePart` writes a stall-guard fingerprint before yielding its MergeObs and
+        # > removes it once they converge, so a guard surviving into a fresh `submit` is
+        # > the residue of a run that died mid-merge.  Left in place it costs the affected
+        # > parts one merge attempt each (see `_MAX_MERGE_ATTEMPTS`) for no reason.
+        stale_guards: list[Path] = sorted(db_init._local("raw").glob("*.merge-guard.json"))
+        if stale_guards:
+            console.print(f"clearing {len(stale_guards)} stale merge guard(s) from a previous run...")
+            for guard in stale_guards:
+                guard.unlink(missing_ok=True)
+
         # > do a passive `DBRessurect` on active/failed jobs to update the DB according to the file system
         # > we include FAILED, because resurecction will also update FAILED jobs if data is found on disk
         # > we only need a list of run paths and DBResurrect does the rest
@@ -1096,6 +1158,13 @@ def main() -> None:
         console.print(f"# merge cores: {merge_concurrent}")
         console.print(f"# batch size: {config['run']['jobs_batch_size']}")
 
+        # > Luigi's own log survives the run here.  The console level mirrors the
+        # > `log_level` handed to `luigi.build` below -- this is Luigi's scale, unrelated
+        # > to dokan's `ui.log_level` (`args.log_level`), which drives the status board.
+        luigi_log: Path = Path(config["run"]["path"]) / "luigi.log"
+        setup_luigi_logging(luigi_log, _LUIGI_CONSOLE_LEVEL)
+        console.print(f"# luigi log: [italic]{luigi_log}[/italic]")
+
         # > increase limit on #files to accommodate potentially large #workers we spawn
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (10 * nworkers, resource.RLIM_INFINITY))
@@ -1126,7 +1195,7 @@ def main() -> None:
             detailed_summary=True,
             workers=nworkers,
             local_scheduler=True,
-            log_level="WARNING",
+            log_level=_LUIGI_CONSOLE_LEVEL,
         )  # 'WARNING', 'INFO', 'DEBUG''
         if not getattr(luigi_result, "scheduling_succeeded", True):
             console.print(luigi_result.summary_text)  # type: ignore[union-attr]
