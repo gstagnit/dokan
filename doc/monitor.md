@@ -130,3 +130,43 @@ exactly Luigi's `retry_delay` (900 s by default) between bursts of log activity.
 
 `merge_failure_modes.md` covers the diagnosis: what to check, in what order, and
 the failure modes that produce it.
+
+### A board full of `WRM` and nothing dispatching
+
+Pre-production is a **barrier**, not a pipeline. `Entry.run` stage 1 yields the
+`PreProduction` task of *every* active part and only then reaches `MergeAll` and
+production dispatch, so the slowest part sets the start of production for the
+whole run. A board showing a handful of `WRM` cells among a majority of idle
+`PRD` ones is that barrier, not a stall.
+
+To tell a slow barrier from a stuck one, ask whether the stragglers are still
+taking warmup steps:
+
+```bash
+python3 -c "
+import sqlite3
+d = sqlite3.connect('file:db.sqlite?mode=ro', uri=True)
+for r in d.execute('''select p.name, count(*), max(j.timestamp)
+                        from job j join part p on p.id=j.part_id
+                       where j.mode=1 and j.status in (1,2)
+                    group by p.name order by 3'''):
+    print(r)"
+```
+
+A part that logged a `next warmup step` line recently is converging, and the
+step index is bounded by `max_increment_steps` — it will stop. One whose newest
+activity is `retry_delay` old is not.
+
+Two things make that barrier longer than it needs to be, both worth checking on
+the stragglers specifically rather than on the run as a whole:
+
+* **wall-time kills.** A killed warmup job returns nothing, so the step it
+  belonged to is assessed on fewer seeds, more often fails its quality checks,
+  and triggers another increment. The loss concentrates in the expensive
+  contributions, which are the ones already holding the barrier, so a small
+  overall kill rate can be most of the delay on the parts that matter. See
+  `resource_budgets.md` §"Bounding a single job".
+* **the increment ladder itself.** Each step is a fresh dispatch, so a part
+  needing eight steps pays eight scheduling round-trips before it clears.
+
+Neither is a fault to fix mid-run: the counter to both is set at `init` time.

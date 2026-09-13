@@ -144,6 +144,38 @@ interleaving partial records once a traceback outgrows the stream buffer. Only
 the parent writes, which loses nothing — child failures are already in the log
 database (§4).
 
+## 6. One worker per part means a lot of open files
+
+dokan sizes its worker pool by the number of active parts, and every worker holds
+its own SQLite connections and staged file handles, so a realistic process wants
+file descriptors in the thousands while a login shell typically offers 1024.
+`submit` therefore raises `RLIMIT_NOFILE` before `luigi.build`.
+
+Only the **soft** limit, and only as far as the hard limit allows:
+
+```python
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if soft != resource.RLIM_INFINITY and soft < want:
+    target = want if hard == resource.RLIM_INFINITY else min(want, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+```
+
+The soft limit is the process's own; anyone may raise it up to the hard limit.
+Raising the *hard* limit needs `CAP_SYS_RESOURCE`, and `setrlimit` takes both
+values in one call and rejects the call as a whole — so passing
+`RLIM_INFINITY` as the hard value threw away the soft-limit change that was
+wanted and permitted, and printed
+
+```
+failed to increase RLIMIT_NOFILE: not allowed to raise maximum limit
+```
+
+on every start, for an ordinary user. It was cosmetic — the run then proceeded on
+the inherited limit, which on the systems where it was seen was already ample —
+but it hid the case worth reporting: a hard limit genuinely too low for the
+requested worker count. That case now warns with both numbers, and a system whose
+limit is already sufficient says nothing at all.
+
 ## Checklist for a new Task or Parameter
 
 - [ ] `parse(serialize(v)) == v` for every value the parameter can hold (§1)
@@ -153,3 +185,5 @@ database (§4).
 - [ ] No state written before a `yield` that is later interpreted as evidence
       the yielded work actually ran (§2)
 - [ ] Anything worth seeing on failure goes to the log database, not stderr (§4)
+- [ ] Per-worker resources (file handles, connections) scale with the pool, not
+      with the process (§6)
