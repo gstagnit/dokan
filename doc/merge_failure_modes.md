@@ -170,49 +170,48 @@ With the self-healing above, this manual surgery should not be necessary — the
 merge repairs the cache on its own. Deleting the file outright is in any case
 safer than `h5clear`, since it forces a clean rebuild from the raw `.dat`.
 
-## Failure mode 3: the stall guard cannot see a crash
+## Failure mode 3: a stall guard that cannot see a crash
 
 `MergePart.run()` writes `raw/<part>.merge-guard.json` — a fingerprint of the
-pending `MergeObs` set — and then yields those tasks. If an identical pending set
-comes back, it concludes the merge ran and failed to converge, and raises
-`internal invariant violated: re-merge of unchanged pending set ...`.
+pending `MergeObs` set — and then yields those tasks. The write *must* be
+pre-yield: luigi restarts `run()` from the top once dynamic dependencies
+complete, so nothing after the `yield` executes in that invocation.
 
-The guard write *must* be pre-yield: luigi restarts `run()` from the top after
-dynamic dependencies complete, so nothing after the `yield` executes in that
-invocation. A pre-yield fingerprint consequently cannot distinguish
+A pre-yield fingerprint therefore cannot distinguish
 
 - *MergeObs ran and produced outputs its own `complete()` rejects* — the real bug
   the guard hunts — from
 - *the process died before MergeObs ran*.
 
-Any event that kills workers mid-merge — an OOM burst, `SIGKILL`, a hard
-interrupt — therefore leaves guards behind, and the **next** start aborts every
-affected part immediately with the invariant error. The false positive is
-acknowledged in a code comment, but nothing detects or clears it automatically.
+The guard originally raised on the first verbatim repeat, so any event that
+killed workers mid-merge left guards behind and the **next** start aborted every
+affected part with `internal invariant violated`, naming a bug that had not
+occurred.
 
-**Workaround.** Any `raw/*.merge-guard.json` present while no run is active is by
-definition stale; removing it lets the part retry:
+**How it works now.** The invariant is checked where the evidence is, and the
+guard keeps only the job the check cannot do:
 
-```bash
-ls -l raw/*.merge-guard.json      # inspect first
-rm raw/*.merge-guard.json         # only with no run active
-```
+- **`MergeObs.run()` verifies its own `complete()` before returning.** It knows it
+  ran, so a merge whose output its freshness model rejects fails immediately, in
+  the task that caused it, with the same per-observable diagnostics and no 900 s
+  detour. This is sound because the source HDF5 is opened read-only by every
+  `MergeObs`, and the per-part `MergePart_{part_id}` resource keeps the one
+  `MergePart` that writes it from running concurrently, so the identity cannot
+  shift between the merge and the check.
+- **The guard counts attempts** (`_MAX_MERGE_ATTEMPTS`) instead of tripping on the
+  first repeat, warning on each. What is left for it is the one case the
+  self-check cannot see — `MergePart` and `MergeObs` disagreeing about
+  completeness, which would re-yield forever — so it only has to *terminate*, and
+  a bounded retry does that while tolerating crashes. A crash now costs one
+  attempt rather than aborting the part.
+- **`submit` clears `raw/*.merge-guard.json` at startup**, so a count never
+  carries across runs and residue from a dead run costs nothing.
 
-Before doing so, confirm the parts are healthy rather than genuinely
-non-converging: their HDF5 caches should contain a full complement of objects,
-and `result/part/<part>/` should be *empty*. A real non-convergence leaves `.dat`
-files that fail the freshness check; zero files means `MergeObs` never ran.
-
-**Proper fix (not yet implemented).** Move the invariant to where the evidence
-is: at the end of `MergeObs.run()`, assert `self.complete()` and raise with
-`describe_incomplete()` if it fails. The per-part `MergePart_{part_id}` mutex
-guarantees no concurrent writer, so the identity cannot shift underneath. This is
-correct in both directions — a real non-convergence fails immediately in the task
-that caused it, while a crashed `MergeObs` is just a failed task luigi retries —
-and it makes the guard, and the whole `merge-guard.json` stale-state class,
-redundant. Failing that, the guard could gate its raise on every pending
-observable having its `MergeObs.file_record` sidecar, i.e. on them all having
-actually run.
+If a part does exhaust its attempts, the error names the disagreement and the
+guard path; deleting that file forces a retry. Before doing so, check whether the
+part is genuinely stuck: `result/part/<part>/` empty with a healthy HDF5 cache
+means `MergeObs` never ran, whereas a real non-convergence leaves `.dat` files
+that fail the freshness check.
 
 ## Diagnostics
 
@@ -261,18 +260,41 @@ for i,l,t,m in c.execute('select id,level,timestamp,message from log where level
     print(i, datetime.datetime.fromtimestamp(t).strftime('%H:%M:%S'), m[:200])"
 ```
 
+## Why the parent interpreter grows
+
+Failure mode 1 multiplies whatever the parent is holding, so it is worth knowing
+where that came from. Two luigi properties combine:
+
+- `Worker._scheduled_tasks` and `Worker._add_task_history` are **never pruned**.
+  Every task instance the worker has scheduled is retained for the lifetime of
+  the run, and the workflow creates one instance per dynamic clone — with many
+  parts and repeated merges that reaches tens of thousands.
+- `DictParameter.normalize()` **deep-freezes its input on every instantiation**,
+  so each of those instances used to own a private copy of the run
+  configuration. Measured at ~44 kB per copy, tens of thousands of instances is
+  most of a GB, retained, in the process that every task fork then copies.
+
+`Task.config` therefore uses `SharedDictParameter` (`task.py`), which hands out a
+canonical frozen instance: the retained cost drops from ~0.9 GB to one copy.
+Frozen values are immutable, so sharing is safe, and the value still compares
+equal to what `DictParameter` produced, leaving task ids and the
+`to_str_params()` round-trip untouched.
+
+The retention itself is luigi's and remains: the task objects stay alive, they
+are simply small now. If the parent is ever seen growing again, `_scheduled_tasks`
+is the first place to look, and the question is what those instances are holding
+rather than how many there are.
+
 ## Open items
 
-1. **Move the stall invariant into `MergeObs.run()`** (failure mode 3 above),
-   retiring the merge-guard mechanism.
-2. **Sweep stale guards at startup.** Any `raw/*.merge-guard.json` present when
-   `submit` starts is from a dead process. The startup sweep already purges
-   never-started jobs and prompts about FAILED ones.
-3. **Persist luigi's own log** to `<rundir>/luigi.log` via a `FileHandler`, and
-   reconsider `log_level="WARNING"` in `luigi.build` — it suppresses luigi's
-   scheduler-level notices, which the event handlers do not replace.
-4. **The fork-per-task memory model remains fragile.** The `merge_concurrent`
-   cap addresses the merge fan-out, but any large fan-out of `DBTask`s forks the
-   same parent, and `DBTask` is sized at `nactive_part + 2`. Worth understanding
-   why the parent grows to several GB, and whether that is a leak: a smaller
-   parent makes every concurrency limit less critical.
+Nothing outstanding from the failure modes above. Two things are worth keeping in
+view:
+
+1. **`DBTask` is still sized at `nactive_part + 2`.** The `merge_concurrent` cap
+   bounds the merge fan-out specifically, and a lighter parent makes every fork
+   cheaper, but a large simultaneous fan-out of other `DBTask`s is still possible
+   in principle. Lowering `DBTask` was rejected deliberately: it would also
+   throttle the batch-system pollers and slow the whole workflow.
+2. **`luigi.log` is written by every forked worker in append mode.** Records from
+   different processes interleave; individual writes are small enough to arrive
+   intact, which is all a diagnostic log needs, but it is not a serialized stream.
