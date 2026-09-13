@@ -50,7 +50,7 @@ from .preproduction import (
 )
 from .runcard import Runcard, RuncardTemplate
 from .scheduler import WorkerSchedulerFactory
-from .util import format_time_interval, parse_time_interval
+from .util import format_cpu_time, parse_time_interval
 
 
 # > Luigi's console verbosity (its own scale, not dokan's `ui.log_level`): the live
@@ -759,7 +759,7 @@ def main() -> None:
         config["run"]["jobs_max_total_runtime"] = max(0.0, new_total_runtime)
         console.print(
             "[dim]jobs_max_total_runtime = "
-            f"{format_time_interval(config['run']['jobs_max_total_runtime'])}[/dim]"
+            f"{format_cpu_time(config['run']['jobs_max_total_runtime'])}[/dim]"
             if config["run"]["jobs_max_total_runtime"] > 0.0
             else "[dim]jobs_max_total_runtime = 0 (derived from the job count)[/dim]"
         )
@@ -1215,9 +1215,9 @@ def main() -> None:
             + (f"{n_cap_cfg} jobs/submission" if n_cap_cfg > 0 else "unlimited jobs")
             + "   runtime budget: "
             + (
-                format_time_interval(t_cap_cfg)
+                format_cpu_time(t_cap_cfg)
                 if t_cap_cfg > 0.0
-                else f"{format_time_interval(n_cap_cfg * config['run']['job_max_runtime'])} (derived)"
+                else f"{format_cpu_time(n_cap_cfg * config['run']['job_max_runtime'])} (derived)"
             )
         )
         console.print(f"# batch size: {config['run']['jobs_batch_size']}")
@@ -1229,11 +1229,27 @@ def main() -> None:
         setup_luigi_logging(luigi_log, _LUIGI_CONSOLE_LEVEL)
         console.print(f"# luigi log: [italic]{luigi_log}[/italic]")
 
-        # > increase limit on #files to accommodate potentially large #workers we spawn
-        try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (10 * nworkers, resource.RLIM_INFINITY))
-        except ValueError as err:
-            console.print(f"failed to increase RLIMIT_NOFILE: {err}")
+        # > raise the open-file limit for the workers we are about to spawn.
+        # >
+        # > Only the *soft* limit, and only up to the hard one.  Raising the hard limit
+        # > needs CAP_SYS_RESOURCE, so asking for `RLIM_INFINITY` fails for any ordinary
+        # > user -- and the whole call is then rejected, including the soft-limit part
+        # > that was actually wanted and permitted.  It also reported a failure on
+        # > systems whose limit was already generous, which is noise.
+        want_nofile: int = 10 * nworkers
+        soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_nofile != resource.RLIM_INFINITY and soft_nofile < want_nofile:
+            target: int = want_nofile if hard_nofile == resource.RLIM_INFINITY else min(want_nofile, hard_nofile)
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard_nofile))
+            except (OSError, ValueError) as err:
+                console.print(f"[yellow]could not raise the open-file limit to {target}: {err}[/yellow]")
+            else:
+                if target < want_nofile:
+                    console.print(
+                        f"[yellow]open-file limit capped at {target} by the hard limit"
+                        f" ({want_nofile} wanted for {nworkers} workers)[/yellow]"
+                    )
 
         # > actually submit the root task to run NNLOJET and spawn the monitor
         # > pass config since it changed w.r.t. db_init

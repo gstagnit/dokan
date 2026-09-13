@@ -33,7 +33,7 @@ from ..merge._core import (
     build_obs_group,
 )
 from ..order import Order
-from ..util import format_time_interval, read_json_sidecar, write_json_sidecar
+from ..util import format_cpu_time, read_json_sidecar, write_json_sidecar
 from ._dbtask import DBTask
 from ._jobstatus import JobStatus
 from ._loglevel import LogLevel
@@ -834,9 +834,9 @@ class MergeAll(DBMerge):
             n_used, t_sub, t_all = self.budget_used(session)
             t_used = t_all if t_explicit else t_sub
             budget_line: str = "\n[dim]budget: " + (
-                f"{format_time_interval(t_used)} / {format_time_interval(t_cap)} runtime"
+                f"{format_cpu_time(t_used)} / {format_cpu_time(t_cap)} runtime"
                 if math.isfinite(t_cap)
-                else f"{format_time_interval(t_used)} runtime (no cap)"
+                else f"{format_cpu_time(t_used)} runtime (no cap)"
             )
             budget_line += (
                 f"  ·  {n_used} / {int(n_cap)} jobs"
@@ -845,13 +845,13 @@ class MergeAll(DBMerge):
             )
             t_need: float = max(0.0, float(opt_dist.get("T_target") or 0.0))
             if t_need > 0.0:
-                budget_line += f"\nstill need ~{format_time_interval(t_need)}"
+                budget_line += f"\nstill need ~{format_cpu_time(t_need)}"
                 if math.isfinite(t_cap):
                     t_left: float = max(0.0, t_cap - t_used)
                     budget_line += (
-                        f" of {format_time_interval(t_left)} left"
+                        f" of {format_cpu_time(t_left)} left"
                         if t_need <= t_left
-                        else f" but only {format_time_interval(t_left)} left"
+                        else f" but only {format_cpu_time(t_left)} left"
                         + " [red]-> target not reachable within budget[/red]"
                     )
             budget_line += "[/dim]"
@@ -1111,7 +1111,7 @@ class MergeFinal(DBMerge):
             self._logger(
                 session,
                 f"\n[blue]cross = ({self.result} +/- {self.error}) fb  [{rel_acc * 1e2:.3}%][/blue]"
-                + f"\n[dim](total runtime invested: {format_time_interval(T_tot)})[/dim]",
+                + f"\n[dim](total runtime invested: {format_cpu_time(T_tot)})[/dim]",
             )
             # > use `distribute_time` to fetch optimization target
             # > & time estimate to reach desired accuracy
@@ -1147,7 +1147,7 @@ class MergeFinal(DBMerge):
                 self._logger(
                     session,
                     "still require about"
-                    + f" [bold]{format_time_interval(T_target)}[/bold]"
+                    + f" [bold]{format_cpu_time(T_target)}[/bold]"
                     + " of runtime to reach desired target accuracy"
                     + f" [dim](approx. {njobs_target} jobs)[/dim]",
                 )

@@ -179,6 +179,25 @@ def format_time_interval(seconds: float) -> str:
     return " ".join(result) if result else "0 seconds"
 
 
+def format_cpu_time(seconds: float) -> str:
+    """Format an amount of CPU time, in hours or kilo-hours.
+
+    Deliberately not `format_time_interval`.  That renders a wall-clock duration
+    as d/h/m/s, which is the wrong unit for a resource: a 30000-hour budget shown
+    as "1250d" reads as elapsed time, when it is an amount of compute that a few
+    thousand cores get through in an afternoon.  Hours are the unit these numbers
+    are reasoned about and quoted in.
+    """
+    hours: float = seconds / 3600.0
+    if hours >= 1000.0:
+        return f"{hours / 1000.0:.1f} kh"
+    if hours >= 10.0:
+        return f"{hours:.0f} h"
+    if hours >= 0.1:
+        return f"{hours:.1f} h"
+    return f"{seconds:.0f} s"
+
+
 def is_finite_number(x) -> bool:
     """Whether `x` is an int/float (not bool, an int subclass) and finite.
 

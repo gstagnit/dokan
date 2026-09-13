@@ -137,6 +137,14 @@ answer takes over on the next pass. On the run above it reports ~345 days of
 runtime (~16600 jobs), consistent with the 7.9x more statistics that closing
 28.2% to 10% demands.
 
+### Units
+
+CPU budgets are reported in hours, or kilo-hours once large (`format_cpu_time`),
+*not* through `format_time_interval`. The latter renders a wall-clock duration as
+d/h/m/s, which is the wrong unit for a resource: a 30000-hour budget shown as
+"1250d" reads as elapsed time, when it is an amount of compute a few thousand
+cores get through in an afternoon.
+
 ## Bounding a single job
 
 ### `job_max_runtime` is an integration budget, not a wall-clock limit
