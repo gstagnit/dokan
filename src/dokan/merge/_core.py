@@ -1112,3 +1112,17 @@ class MergeObs(Task):
         # > the final step, once every output is on disk.  `complete()` compares this against the
         # > live state, so a crash before here simply leaves the task incomplete and it re-merges.
         self._write_merge_record(ndat, src_ts)
+
+        # > Invariant: a merge that has just run must satisfy its own freshness check.
+        # > Assert it *here*, where the evidence is.  `MergePart` can only observe that an
+        # > observable is still pending and cannot tell that apart from a crash before the
+        # > merge ever started, which is why its stall guard needs heuristics; this task
+        # > knows it ran.  Safe to evaluate now: the source HDF5 is opened read-only by
+        # > every MergeObs, and the per-part `MergePart_{part_id}` resource keeps the one
+        # > `MergePart` that writes it from running concurrently, so the identity cannot
+        # > shift between the merge above and the check here.
+        if not self.complete():
+            raise RuntimeError(
+                f"MergeObs[{'/'.join(self.hdf5_path)}]: the merge ran but its own freshness "
+                f"check rejects the result: {self.describe_incomplete()}"
+            )

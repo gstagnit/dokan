@@ -61,6 +61,12 @@ from ._sqla import Job, Log, Part
 # > mismatch against the runcard, say) is a genuine inconsistency and stays fatal.
 _HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
 
+# > How often `MergePart` may re-yield an unchanged pending set before giving up.  Each
+# > crash mid-merge costs one attempt, so this must exceed 1 for a run to survive being
+# > killed; it stays small because a genuine livelock has to terminate.  `submit` clears
+# > the guards at startup, so the count never carries across runs.
+_MAX_MERGE_ATTEMPTS: int = 3
+
 
 class DBMerge(DBTask, metaclass=ABCMeta):
     # > flag to force a re-merge (if new jobs are in a `done` state but not yet `merged`)
@@ -526,27 +532,48 @@ class MergePart(DBMerge):
                     )
                 )
             )
+            # > The guard counts attempts rather than tripping on the first verbatim repeat.
+            # > It has to be written *before* the yield (Luigi restarts run() from the top and
+            # > never returns here), so a repeated fingerprint cannot distinguish "MergeObs ran
+            # > and did not converge" from "the process died before MergeObs ran" -- and a mass
+            # > kill mid-merge (an OOM burst, say) makes the latter the common case, which
+            # > previously aborted every affected part on the next start.  Genuine
+            # > non-convergence is now caught at its source instead: `MergeObs.run()` verifies
+            # > its own `complete()` before returning.  What is left for this guard is the one
+            # > case that check cannot see -- MergePart and MergeObs disagreeing about
+            # > completeness, which would re-yield forever -- so it only has to terminate, and a
+            # > bounded retry does that while tolerating crashes.
             prior_guard = read_json_sidecar(guard_file)
+            attempt: int = 1
             if prior_guard is not None and prior_guard.get("pending_identity") == pending_identity:
-                # > Invariant: re-merging an unchanged pending set must converge.  Identity is
-                # > deterministic (sidecar vs. live HDF5/config, no mtime), so reaching here means
-                # > `MergeObs.run()` produced outputs its own `complete()` still rejects — a bug in
-                # > the merge or its freshness model, or a corrupt/failed sidecar write.  Fail loudly
-                # > with per-observable diagnostics rather than loop forever or finalize a bad part.
-                # > (Rare false positive: a crash after the guard write but before MergeObs ran;
-                # > deleting the guard file forces a retry.)
+                attempt = int(prior_guard.get("attempt", 1)) + 1
+            if attempt > _MAX_MERGE_ATTEMPTS:
                 diagnostics = "; ".join(
                     f"{obs}: {mrg_obs.describe_incomplete(obs_identity[obs])}"
                     for obs, mrg_obs in sorted(pending_obs.items())
                 )
                 raise RuntimeError(
                     self._logger_prefix
-                    + "::run:  internal invariant violated: re-merge of unchanged pending set "
-                    + f"{sorted(pending_obs)} for part {pt_name} did not converge (bug in MergeObs "
-                    + f"freshness or merge); refusing to finalize.  Diagnostics: {diagnostics}  "
-                    + f"(delete {guard_file} to force a retry after investigating)"
+                    + f"::run:  internal invariant violated: {attempt - 1} merges of an unchanged"
+                    + f" pending set {sorted(pending_obs)} for part {pt_name} did not converge"
+                    + " (MergePart and MergeObs disagree on completeness); refusing to finalize."
+                    + f"  Diagnostics: {diagnostics}  (delete {guard_file} to force a retry"
+                    + " after investigating)"
                 )
-            write_json_sidecar(guard_file, {"pending_identity": pending_identity})
+            if attempt > 1:
+                self._flush_logs(
+                    [
+                        (
+                            self._logger_prefix
+                            + f"::run:  merge attempt {attempt}/{_MAX_MERGE_ATTEMPTS} for an"
+                            + f" unchanged pending set of {len(pending_obs)} observable(s)",
+                            LogLevel.WARN,
+                        )
+                    ]
+                )
+            write_json_sidecar(
+                guard_file, {"pending_identity": pending_identity, "attempt": attempt}
+            )
             yield list(pending_obs.values())
         # > merge converged for the current inputs: retire the guard fingerprint
         guard_file.unlink(missing_ok=True)
