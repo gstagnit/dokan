@@ -385,6 +385,11 @@ rejection. Discarding large-weight events is not free either — they can be rea
 contributions that cancel against opposite-sign events of similar size, so
 trimming a small sample can bias the answer rather than clean it.
 
+> **Superseded in part.** Removal is now off by default
+> (`trim_max_fraction = 0`) and the detector reports instead. The reasoning, the
+> measurements, and how to re-enable it are in `outlier_trimming.md`; the
+> discontinuity described below is what the new default removes.
+
 ### The discontinuity
 
 Because the cap is a pure fraction with no floor, a part's central value can move

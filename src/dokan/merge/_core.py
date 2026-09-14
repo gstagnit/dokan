@@ -763,6 +763,7 @@ class MergeObs(Task):
                 "cfg": self._merge_settings(),
                 "grids": bool(self.grids),
                 "weights": self.file_wgt is not None,
+                "diag": getattr(self, "_diag", None),
             },
         )
 
@@ -934,8 +935,18 @@ class MergeObs(Task):
                 nend = np.sum(_mask)
                 assert nend <= nstart
 
+            # > Outlier diagnostics.  These are *reported*, not acted on: see
+            # > doc/outlier_trimming.md.  The decisive quantity is `max_share` -- the
+            # > fraction of the bin's integral carried by the flagged datasets.  A
+            # > spurious outlier contributes almost nothing to it; one that carries the
+            # > integral is the physics, and removing it would not clean the sample but
+            # > change the answer.
+            diag = {"bins": 0, "bins_flagged": 0, "n_flagged": 0, "max_share": 0.0,
+                    "n_trimmed": 0, "bins_no_plateau": 0}
+
             for irow in range(nrows):
                 for icol in range(ncols):
+                    diag["bins"] += 1
                     # > populate the arrays to perform the merge
                     h5dat_data.read_direct(bin_data, source_sel=np.s_[irow, icol, :ndat])
                     # > we operate on the f & f2 cumulants from here on, leave `bin_data` alone
@@ -998,6 +1009,18 @@ class MergeObs(Task):
                                 / np.where(below, scale_lo, scale_hi)
                                 * np.sqrt(bin_cmlt["neval"][_mask] / avg_neval)
                             )
+                            # > record what the detector found *before* anything is removed,
+                            # > and independently of whether removal is enabled at all
+                            _cand = _mask & (bin_buf1 > trim_threshold)
+                            _n_cand = int(np.sum(_cand))
+                            if _n_cand > 0:
+                                diag["bins_flagged"] += 1
+                                diag["n_flagged"] = max(diag["n_flagged"], _n_cand)
+                                _tot_f = float(np.sum(bin_cmlt["sumf"][_mask]))
+                                if _tot_f != 0.0:
+                                    _share = abs(float(np.sum(bin_cmlt["sumf"][_cand])) / _tot_f)
+                                    diag["max_share"] = max(diag["max_share"], _share)
+
                             # > trim the most significant offsets first, stopping once we drop below
                             # > the threshold or reach the maximum fraction of jobs we may trim
                             max_trim = trim_max_fraction * ndat
@@ -1005,9 +1028,13 @@ class MergeObs(Task):
                                 if bin_buf1[itrim] <= trim_threshold or (ntrim + 1) > max_trim:
                                     break
                                 bin_mask[itrim] = BinMask.TRIMMED
-                            # > trimmed datasets are accumulated into a mega "outlier" dataset
-                            # > which will eventually be suppressed in the weighted average by the large error
+                            # > Trimmed datasets are pooled into the trailing slot, which is then
+                            # > marked INVALID -- i.e. they are *discarded*, not down-weighted.  That
+                            # > is why removal is disabled by default (`trim_max_fraction = 0`): the
+                            # > k-scan below is the bias control, and it can only see a bias in data
+                            # > it still has.
                             _mask = bin_mask == BinMask.TRIMMED
+                            diag["n_trimmed"] = max(diag["n_trimmed"], int(np.sum(_mask)))
                             bin_cmlt["neval"][ndat] = np.sum(bin_cmlt["neval"][_mask])
                             bin_cmlt["sumf"][ndat] = np.sum(bin_cmlt["sumf"][_mask])
                             bin_cmlt["sumf2"][ndat] = np.sum(bin_cmlt["sumf2"][_mask])
@@ -1050,6 +1077,13 @@ class MergeObs(Task):
                         merge_pair()
 
                     merged_hist[irow, icol] = k_scan[-1][:2]
+                    # > `n_active <= 1` means no plateau was found and the ladder ran all the
+                    # > way to the fully pooled estimate: the inverse-variance and pooled ends
+                    # > never agreed, which is the signature of a seed sample too small to
+                    # > resolve the tail.  Paired with a large relative error it means "more
+                    # > seeds", and it is the one signal worth acting on.
+                    if k_scan[-1][2] <= 1:
+                        diag["bins_no_plateau"] += 1
                     # > determine weights (only for the "central" prediction)
                     if weights is not None and icol == 0:
                         for idat in range(ndat):
@@ -1111,6 +1145,7 @@ class MergeObs(Task):
         # > record the full artifact identity (HDF5 inputs, reset epoch, merge config, grids) as
         # > the final step, once every output is on disk.  `complete()` compares this against the
         # > live state, so a crash before here simply leaves the task incomplete and it re-merges.
+        self._diag = diag
         self._write_merge_record(ndat, src_ts)
 
         # > Invariant: a merge that has just run must satisfy its own freshness check.

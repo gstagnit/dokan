@@ -124,8 +124,13 @@ _schema: dict = {
         "min_number": int,  # minimum #of production jobs beyond pre-production (defaults to 1)
     },
     "merge": {
-        "trim_threshold": float,  # threshold to trim outliers
-        "trim_max_fraction": float,  # maximum fraction to trim (dynamically adjust threshod to satisfy)
+        # > robust-z threshold above which a dataset is *flagged* as an outlier.  0
+        # > switches detection off entirely, and with it the outlier diagnostics.
+        "trim_threshold": float,
+        # > largest fraction of a bin's datasets that may actually be REMOVED.  0 (the
+        # > default) reports outliers without discarding any -- removal cannot be
+        # > validated from the data, see doc/outlier_trimming.md.
+        "trim_max_fraction": float,
         "k_scan_nsteps": int,  # number of scan steps to consider for finding the plateau
         "k_scan_maxdev_steps": float,  # maximum deviation to identify a plateau
     },

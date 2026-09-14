@@ -71,7 +71,7 @@ def _load_default_merge() -> dict:
     except (OSError, ValueError, KeyError):
         return {
             "trim_threshold": 8,
-            "trim_max_fraction": 0.007,
+            "trim_max_fraction": 0.0,
             "k_scan_nsteps": 3,
             "k_scan_maxdev_steps": 0.4,
         }

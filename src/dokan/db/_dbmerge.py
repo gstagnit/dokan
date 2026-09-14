@@ -225,6 +225,61 @@ class MergePart(DBMerge):
             ]
         )
 
+    def _log_outlier_diagnostics(self, session, mrg_obs_dict: dict) -> None:
+        """Surface what the outlier detector saw, aggregated over the part's observables.
+
+        Removal is disabled by default, so these numbers are a diagnosis rather than a
+        record of surgery.  Two of them are worth acting on:
+
+        * `no plateau in N bin(s)` -- the k-scan walked its whole bias/variance ladder
+          without the inverse-variance and pooled ends ever agreeing.  Together with a
+          large relative error that means the seed sample is too small to resolve the
+          tail, and the answer is more seeds.  It is the only reliable signal here.
+        * `carrying X% of the integral` -- how much of the bin's integral the flagged
+          datasets hold.  Near zero they are noise; of order one they *are* the result,
+          and no amount of cleverness in the merge can tell which from the data alone
+          (removing such a dataset shifts the mean by about the same amount as it
+          inflates the error, so the shift is never significant -- see
+          doc/outlier_trimming.md).
+
+        Silent when there is nothing to say, which is the common case.
+        """
+        worst_obs: str = ""
+        agg = {"bins_flagged": 0, "n_flagged": 0, "max_share": 0.0,
+               "n_trimmed": 0, "bins_no_plateau": 0}
+        for obs, task in mrg_obs_dict.items():
+            record = getattr(task, "file_record", None)
+            meta = read_json_sidecar(record) if record is not None else None
+            diag = meta.get("diag") if isinstance(meta, dict) else None
+            if not isinstance(diag, dict):
+                continue
+            for key in ("bins_flagged", "n_trimmed", "bins_no_plateau"):
+                agg[key] += int(diag.get(key) or 0)
+            agg["n_flagged"] = max(agg["n_flagged"], int(diag.get("n_flagged") or 0))
+            share = float(diag.get("max_share") or 0.0)
+            if share > agg["max_share"]:
+                agg["max_share"], worst_obs = share, obs
+
+        if not (agg["bins_flagged"] or agg["n_trimmed"] or agg["bins_no_plateau"]):
+            return
+
+        parts: list[str] = []
+        if agg["bins_flagged"]:
+            parts.append(
+                f"outliers flagged in {agg['bins_flagged']} bin(s), up to {agg['n_flagged']} per bin"
+                + (
+                    f", worst carrying {100.0 * agg['max_share']:.0f}% of the integral"
+                    f" ({worst_obs})"
+                    if agg["max_share"] > 0.0
+                    else ""
+                )
+            )
+        if agg["n_trimmed"]:
+            parts.append(f"[yellow]{agg['n_trimmed']} discarded[/yellow]")
+        if agg["bins_no_plateau"]:
+            parts.append(f"no k-scan plateau in {agg['bins_no_plateau']} bin(s): more seeds needed")
+        self._logger(session, self._logger_prefix + "::run:  " + "; ".join(parts))
+
     def _stage_histograms(
         self,
         hdf5_file: Path,
@@ -694,6 +749,7 @@ class MergePart(DBMerge):
                 + f"::run: {max_rel_hist_err=}  pt.result = {pt.result} +/- {pt.error}"
                 + f" (rel_err = {rel_cross_err:.3e})",
             )
+            self._log_outlier_diagnostics(session, mrg_obs_dict)
             self._safe_commit(session)
 
         #############################
