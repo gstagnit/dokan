@@ -109,13 +109,10 @@ class MergePart(DBMerge):
     @property
     def _logger_prefix(self) -> str:
         # > lazy: the part-name lookup must not happen at construction time
-        return (
-            "MergePart"
-            + f"[{self._part_name(self.part_id)}"
-            + (f", force={self.force}" if self.force else "")
-            + (f", reset={time.ctime(self.reset_tag)}" if self.reset_tag > 0.0 else "")
-            + "]"
-        )
+        # > `force` and `reset_tag` are task identity, not information the reader needs on
+        # > every line: they are constant for a whole merge pass and were pushing the part
+        # > name off the edge of the log panel.  They remain in the Luigi task id.
+        return f"MergePart[{self._part_name(self.part_id)}]"
 
     @property
     def select_job(self):
@@ -785,17 +782,9 @@ class MergeAll(DBMerge):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._logger_prefix: str = "MergeAll"
-        if self.force or self.reset_tag > 0.0 or self.finalize:
-            self._logger_prefix += (
-                "["
-                + ", ".join(
-                    ([f"force={self.force}"] if self.force else [])
-                    + ([f"reset={time.ctime(self.reset_tag)}"] if self.reset_tag > 0.0 else [])
-                    + (["finalize"] if self.finalize else [])
-                )
-                + "]"
-            )
+        # > only `finalize` changes what the task does from the reader's point of view;
+        # > `force`/`reset_tag` are identity and stay in the Luigi task id.
+        self._logger_prefix: str = "MergeAll[finalize]" if self.finalize else "MergeAll"
         # > output directory (created in run(): construction must stay side-effect free)
         self.mrg_path: Path = self._path.joinpath("result", "merge")
         self.merge_marker: Path = self._path.joinpath("result", "merge_all.json")
@@ -1147,10 +1136,6 @@ class MergeFinal(DBMerge):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._logger_prefix: str = "MergeFinal"
-        if self.force or self.reset_tag > 0.0:
-            self._logger_prefix = (
-                self._logger_prefix + f"[force={self.force}, reset={time.ctime(self.reset_tag)}]"
-            )
 
         # > output directory
         self.fin_path: Path = self._path.joinpath("result", "final")

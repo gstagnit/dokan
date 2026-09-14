@@ -71,23 +71,65 @@ re-checks), so `run()` should return early rather than redo work.
 ## 3. The worker never forgets a task
 
 `worker.Worker` keeps `_scheduled_tasks` and `_add_task_history` for the lifetime
-of the run and prunes neither. Every task instance ever scheduled is retained,
-and dokan creates one instance per dynamic clone — tens of thousands over a long
-run.
+of the run and prunes neither, and the scheduler is no better: `update_status`
+marks a task removable only once it has **no stakeholders**, and the single
+long-lived worker is a stakeholder of everything it ever scheduled. Setting
+`prune_on_get_work=True` therefore does nothing here — `prune()` runs and finds
+nothing it may remove.
 
-This makes **anything a parameter carries a per-instance, permanent cost**, and
+So **anything a parameter carries has a per-instance, permanent cost**, and
 because Luigi forks a process per task attempt, the parent's accumulated size is
 paid again by every fork.
 
-`DictParameter.normalize()` deep-freezes its input on *every* instantiation, so
-a configuration dict handed to every task used to be copied per instance. Hence
-`SharedDictParameter` in `task.py`, which returns a canonical frozen instance —
-frozen values are immutable, so sharing is safe, and the value still compares
-equal to what `DictParameter` produced (task ids and the `to_str_params()`
-round-trip are unaffected).
+### Sharing the value is not enough — share the *serialisation* too
 
-**When adding a parameter that carries a payload** — a dict, a long list, a
-blob — assume it will be retained a few tens of thousands of times.
+`DictParameter.normalize()` deep-freezes its input on every instantiation, so a
+configuration dict handed to every task is copied per instance. `SharedDictParameter`
+in `task.py` returns a canonical frozen instance instead; frozen values are
+immutable, so sharing is safe, and the value still compares equal to what
+`DictParameter` produced.
+
+That fixes the *dict* and leaves the bigger half of the problem. `Worker._add_task`
+serialises a task's parameters and the scheduler keeps that dict for the task's
+lifetime (`scheduler.Task.params`, plus its public/hidden views). `json.dumps`
+returns a fresh string on every call, so every scheduled task pinned its own copy
+of the configuration — measured at a 21 kB config, 2000 serialisations produced
+2000 distinct strings.
+
+`SharedDictParameter.serialize()` now memoises as well. End to end, adding tasks
+through dokan's own worker/scheduler factory:
+
+| | retained per task | distinct config strings (400 tasks) |
+|---|---|---|
+| before | 26.9 kB | 400 |
+| after | **0.6 kB** | **1** |
+
+A 98% cut: about 10 GB against 0.2 GB over 400k task instances. It is also ~60x
+faster per call. This was the dominant term in a growth rate measured at ~0.8
+GB/hour on two independent campaigns (5.41 GB at 6h44m, 8.40 GB at 10h36m).
+
+### The task history is capped
+
+`_add_task_history` gets one entry per status change of every task, each holding
+a task reference, and is drained only by `luigi.execution_summary` at the end.
+`WorkerSchedulerFactory.create_worker` replaces it with a bounded `deque`
+(`_TASK_HISTORY_MAX`). A deque supports everything the summary does with it
+(iteration and `[0]`), so the only consequence is that the summary describes the
+recent tail rather than the whole run — and dokan reports through its own monitor
+and log database anyway.
+
+### What is still unbounded
+
+`_scheduled_tasks` and the scheduler's own task table still grow with the number
+of distinct tasks. With the payload no longer duplicated, what remains is the
+Task objects themselves — small, but not nothing. Pruning them is possible in
+principle (the worker reconstructs a missing task via `load_task`, so it is
+designed to tolerate the scheduler forgetting), but it means reaching into Luigi
+internals and re-parsing parameters, and it is not currently done.
+
+**When adding a parameter that carries a payload** — a dict, a long list, a blob
+— assume it will be retained once per task instance *and* serialised once per
+task instance, and give it the same treatment.
 
 ## 4. Task failures reach only stderr, which is not readable here
 

@@ -1,4 +1,13 @@
+import collections
+
 from luigi import rpc, scheduler, worker
+
+# > cap on `Worker._add_task_history`, which Luigi appends to on every status
+# > change of every task and never drains.  Only `luigi.execution_summary`
+# > reads it, and dokan reports through its own monitor and log database, so a
+# > truncated tail costs nothing but bounds one of the structures that make a
+# > long-running worker grow without limit.
+_TASK_HISTORY_MAX: int = 10000
 
 
 class WorkerSchedulerFactory:
@@ -51,8 +60,16 @@ class WorkerSchedulerFactory:
         return rpc.RemoteScheduler(url)
 
     def create_worker(self, scheduler, worker_processes, assistant=False):
-        """Create a Luigi worker with configured polling/check behavior."""
-        return worker.Worker(
+        """Create a Luigi worker with configured polling/check behavior.
+
+        The worker's task history is capped (see `_TASK_HISTORY_MAX`).  Luigi grows
+        it forever otherwise: one entry per status change, each holding a reference
+        to the task, drained only by the end-of-run execution summary.  A `deque`
+        supports everything `execution_summary` does with it (iteration and `[0]`),
+        so the only consequence is that the summary describes the recent tail rather
+        than the whole run.
+        """
+        w = worker.Worker(
             scheduler=scheduler,
             worker_processes=worker_processes,
             assistant=assistant,
@@ -63,3 +80,5 @@ class WorkerSchedulerFactory:
             wait_jitter=self.wait_jitter,
             ping_interval=self.ping_interval,
         )
+        w._add_task_history = collections.deque(maxlen=_TASK_HISTORY_MAX)
+        return w

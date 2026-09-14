@@ -29,6 +29,7 @@ class SharedDictParameter(luigi.DictParameter):
     """
 
     _canonical: dict[int, object] = {}
+    _canonical_str: dict[int, tuple] = {}
 
     def normalize(self, value):
         frozen = super().normalize(value)
@@ -41,6 +42,35 @@ class SharedDictParameter(luigi.DictParameter):
             return cached
         type(self)._canonical[key] = frozen
         return frozen
+
+    def serialize(self, value):
+        """Hand out one shared JSON string per distinct configuration.
+
+        Sharing the *frozen dict* is not enough.  `Worker._add_task` serialises a
+        task's parameters and the scheduler keeps that dict for the task's lifetime
+        (`scheduler.Task.params`, plus its public/hidden views), and nothing prunes it
+        while the worker stays alive -- a task is only marked removable once it has no
+        stakeholders, and the single long-lived worker is a stakeholder of everything
+        it ever scheduled.  `json.dumps` returns a fresh string every call, so each
+        scheduled task pinned its own copy of the run configuration.
+
+        Measured at 21 kB of config: 2000 serialisations produced 2000 distinct
+        strings and 20.6 kB of retained heap per task -- about 1 GB per 50k task
+        instances, which a long run reaches easily.
+
+        Equality is re-checked before reusing a cached entry, so a hash collision
+        degrades to "no sharing" rather than to the wrong parameters.
+        """
+        try:
+            key: int = hash(value)
+        except TypeError:
+            return super().serialize(value)
+        hit = type(self)._canonical_str.get(key)
+        if hit is not None and hit[0] == value:
+            return hit[1]
+        text = super().serialize(value)
+        type(self)._canonical_str[key] = (value, text)
+        return text
 
 
 class Task(luigi.Task):
