@@ -767,17 +767,32 @@ class MergeAll(DBMerge):
         if any(not mpt.complete() for mpt in self.requires()):
             return False
 
+        marker = self._read_merge_marker()
+        if not self._marker_is_current(marker):
+            return False
+
         if self.finalize:
-            marker = self._read_merge_marker()
-            if marker is None:
-                return False
-            if self.run_tag > float(marker.get("run_tag", -1.0)):
-                return False
+            # > the merge behind the marker is up to date; the per-order files also have
+            # > to have been written *for that state*.  Checking only `finalized` here --
+            # > as this branch used to, returning before the freshness checks above -- was
+            # > safe only while nothing set the flag before the end of the run.  With
+            # > `finalize_interval` refreshing it hourly, an early return would let
+            # > `MergeFinal` accept a `result/final` written before the last parts were
+            # > merged: everything merged, so the required `MergePart`s all read complete,
+            # > and a stale `finalized` flag then satisfied the task.
+            assert marker is not None  # `_marker_is_current` rejects None
             if self.fini_tag > float(marker.get("fini_tag", -1.0)):
                 return False
             return bool(marker.get("finalized", False))
 
-        marker = self._read_merge_marker()
+        return True
+
+    def _marker_is_current(self, marker: dict | None) -> bool:
+        """Return True when the merge marker describes the present state of the parts.
+
+        Shared by both branches of `complete()`: whether the per-order files are also
+        wanted is a separate question from whether the merge underneath them is stale.
+        """
         if marker is None:
             return False
         marker_run_tag = float(marker.get("run_tag", -1.0))

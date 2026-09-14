@@ -75,6 +75,43 @@ if self.fini_tag > float(marker.get("fini_tag", -1.0)):
 An older request against a newer marker stays satisfied, so a resubmit does not
 re-finalize needlessly.
 
+### `complete()` had to stop trusting the flag alone
+
+Writing `finalized: True` before the end of the run breaks an assumption the
+finalize branch of `MergeAll.complete()` was making. It used to return as soon as
+it had checked the marker's `run_tag`:
+
+```python
+if self.finalize:
+    marker = self._read_merge_marker()
+    ...
+    return bool(marker.get("finalized", False))     # before the freshness checks
+```
+
+skipping the checks the ordinary branch performs — that the active parts still
+match the marker, that no part carries the merge-in-progress sentinel, and that
+no part has been merged since the marker was written. That was safe only while
+nothing set `finalized` before the terminal merge.
+
+With a timer setting it hourly, this sequence loses data:
+
+1. a periodic finalize writes `result/final` and stamps `finalized: True`;
+2. more jobs finish, and the ordinary `MergeAll` that `MergePart` yields folds
+   them into `result/<obs>.dat` — the per-order files are now stale;
+3. the run ends with everything merged, so every required `MergePart` reads
+   complete;
+4. `MergeFinal` asks for `MergeAll(finalize=True)`, which sees the stale
+   `finalized` flag and reports complete.
+
+The per-order files would then be missing the last batch of jobs while
+`result/<obs>.dat` contains them — silently, since nothing failed.
+
+The freshness checks are now factored into `_marker_is_current()` and applied to
+**both** branches; `finalize` adds the `finalized` flag and the `fini_tag`
+comparison on top of them, rather than in place of them. Whether the per-order
+files are wanted is a separate question from whether the merge underneath them is
+current, and the two are now asked separately.
+
 ### `MergeAll` is now mutually exclusive with itself
 
 Every `MergeAll` writes the same `result/<obs>.dat`, and the finalizing ones also
