@@ -1,161 +1,161 @@
-# Outlier trimming, and why it is off
+# Outlier trimming
 
-Double-real channels produce occasional events whose weight is orders of
-magnitude above the bulk. A single seed can return a value millions of times the
-channel's size, with a relative error near 100% — one event carrying the whole
-job. The obvious response is to discard such seeds. This document records why
-dokan does not, and what it does instead.
+Double-real channels occasionally produce a single event whose weight is
+enormous — millions of times the whole cross section. The merge detects these and
+removes them. This document records why that is the right thing to do, because
+the question is subtle and a purely statistical reading of the data gets it
+wrong.
 
-## The estimator is already a bias/variance ladder
+## The phenomenon
 
-`MergeObs` does not simply average the per-seed results. It runs a **k-scan**:
+One seed of one channel returns a value millions of times the bulk, with a
+relative error near 100% — the signature of a single event carrying the entire
+job. Measured in one campaign, for the worst channel:
 
-| rung | estimator | property |
+```
+seed s158:  8,557,287 fb  over 265,910 events   (median seed: 2.6 fb)
+```
+
+The sum of weights in that one job is 2.3e12, against 6.9e5 for a typical job.
+**One event carries 1.14e7 times the total cross section.**
+
+## Why these are artifacts and not physics
+
+The decisive argument is not statistical, it is kinematic.
+
+**All infrared singularities are confined to tcut → 0.** That is what the
+technical cutoff is for: below it the double-real contribution is dropped and the
+subtraction handles the limit. The physical result must be independent of the
+cutoff across the range where the subtraction is doing its job — roughly 1e-10 up
+to 1e-8 or 1e-7. Above that the cut starts removing genuine phase space and
+independence is no longer expected.
+
+The offending events do not live there. Binning each seed's contribution by the
+tcut of its events (`tcut_diff`, remembering it is a *density* on logarithmic
+bins — multiply by bin width to get a contribution):
+
+| seed | contribution | tcut |
 |---|---|---|
-| step 0 | inverse-variance weighted mean over all datasets | minimum variance, **biased** |
-| … | `merge_pair()` pools two pseudo-datasets and re-combines | intermediate |
-| last | one pseudo-dataset: the fully pooled event-level mean | **unbiased**, maximum variance |
+| s158 | 100.5% of the seed in one bin | **1e-4 – 3.2e-4** |
+| s118 | 96.9% | **3.2e-3 – 1e-2** |
+| typical seed | spread over 1e-10…1e-6, cancelling | — |
 
-The bias at step 0 is not a subtlety, it is the central difficulty of heavy-tailed
-integrands: a seed that happens to sample a large-weight event gets both a large
-`|result|` **and** a large variance, so the inverse-variance weight demotes it in
-exact proportion to how much it would have moved the answer. Pooling has no such
-correlation and is unbiased.
+Those are four to eight orders of magnitude **above** the technical cutoff, in
+comfortably resolved kinematics. A correctly subtracted integrand there is finite
+and of order the physical scale. There is no mechanism by which a resolved,
+non-singular phase-space point produces a weight 1e7 times the cross section.
 
-The scan climbs the ladder and stops at the first *plateau* — when successive
-rungs agree within `k_scan_maxdev_steps` of their combined error. **That plateau
-test is the bias control**: it certifies that the low-variance estimate and the
-progressively unbiased ones have converged.
+What does produce exactly this is a **spurious singularity at exceptional
+kinematics** — a vanishing Gram determinant, say. These are not IR singularities,
+are not confined to small tcut, and cause catastrophic cancellation in the
+matrix-element evaluation at otherwise unremarkable points.
 
-## Why trimming before the k-scan breaks it
+## Two independent confirmations
 
-Trimming removes the disputed datasets from the sample the ladder is built on.
-Both ends move: the pooled end no longer contains the events either. The two ends
-then agree trivially, a plateau is declared early, and what has been certified is
-"these agree on a sample the disputed events were already removed from".
+**It reproduces across campaigns.** Two runs of charge-conjugate processes, with
+different channels, different seed numbers and independent random sequences:
 
-Trimmed datasets are pooled into a trailing slot which is then marked `INVALID` —
-they are **discarded**, not down-weighted. (A comment in `_core.py` long claimed
-they "will eventually be suppressed in the weighted average by the large error";
-that describes a different, safer design than the code implements.)
+| run | channel | worst event | tcut bin |
+|---|---|---|---|
+| A | `[0,40]` | +8,557,287 | 1e-4 – 3.2e-4 |
+| B | `[0,-40]` | -9,615,309 | 1e-4 – 3.2e-4 |
 
-Suppressing rather than discarding — keeping the pooled outlier slot `ACTIVE` so
-it rejoins as the ladder climbs — is structurally better and sometimes reproduces
-the untrimmed answer exactly. It is still not sufficient: the plateau can fire
-before the outlier slot rejoins.
-
-## Trimming cannot be validated from the data
-
-The natural safety test is "trim only if the result stays consistent with the
-untrimmed one". **That test is vacuous**, and not for want of statistics.
-
-If one dataset dominates a sample of `n`, removing it shifts the mean by
+Same magnitude to 12%, same tcut bin (about a 3% coincidence across ~30 bins).
+The seven scale variations settle it:
 
 ```
-Delta ~ (r_i - r_bar) / n
+A:   8.60e6  6.38e6  1.20e7  8.61e6  6.39e6  8.48e6  1.18e7
+B:  -9.62e6 -7.16e6 -1.34e7 -9.65e6 -7.18e6 -9.48e6 -1.32e7
+     0.894   0.891   0.896   0.892   0.890   0.895   0.894      <- ratio
 ```
 
-while its own contribution to the variance is `~ (r_i - r_bar)^2 / n^2`, so
+A **constant** ratio across all seven scales: the same matrix-element structure
+evaluated at the same configuration up to one overall normalisation. Two random
+samples of a smooth integrand do not do that. Two approaches to the same spurious
+surface in phase space do.
 
-```
-sigma >~ |r_i - r_bar| / n ~ |Delta|
-```
+**Removal is stable.** Re-merging one campaign three ways:
 
-**The shift and the error are the same quantity.** An outlier inflates the
-untrimmed error in exact proportion to how much removing it would move the
-answer, so the untrimmed estimate can never reject the trim that removes it. The
-prediction is `|Delta| / sigma ~ 1`, and that is what is measured: across 24
-affected parts of one campaign the ratio ran 0.04 to 1.26, against both the
-pooled and the plateau anchor. A 2-sigma test rejected **1** of 17 cases in which
-the discarded seed carried more than 40% of its part's integral.
-
-Applying the test after the k-scan rather than before does not help: the anchor's
-error is inflated by the very outlier in question.
-
-## What does discriminate: the share of the integral
-
-The one quantity that separates a spurious outlier from a real contribution is
-how much of the integral it carries:
-
-```
-share = |sum over flagged datasets of sumf| / |sum over all datasets of sumf|
-```
-
-A numerical artefact contributes almost nothing to the integral. A large-weight
-event that is physically real carries a sizeable fraction of it — and may be
-cancelling against opposite-sign events of similar size, which is why `share` can
-exceed 1.
-
-Measured across two campaigns, for every part a sparsity+Gaussianity gate would
-have accepted:
-
-| candidates' share of the integral | parts | error gain from removing them |
+| | total | error |
 |---|---|---|
-| < 5% | 4 of 13 | x0.88 – x0.99, i.e. nothing |
-| 15 – 70% | 3 | meaningful |
-| 70 – 374% | 6 | large |
+| no removal | 218,138 fb | ± 40,754 (18.7%) |
+| 1 dataset per part | 184,835 fb | ± 5,862 (3.2%) |
+| all 208 flagged datasets | 184,676 fb | ± 3,078 (1.7%) |
 
-**Trimming is safe only where it does not matter, and matters only where it is
-not safe.**
+Removing one artifact per part and removing all 208 differ by **0.09%** in the
+central value while the error halves. That is what removing noise looks like:
+once the worst is gone, further removals stop moving the answer. Had the flagged
+datasets carried real contribution, the central value would have kept sliding.
 
-### Why a Gaussianity criterion is not enough
+## The trap: statistics alone cannot decide this
 
-"Remove the outliers if the rest then fits a Gaussian" is the right instinct but
-an insufficient test: it constrains what remains, not what was taken away. A part
-with 16 datasets, 15 of them in `[-672, +1785]` and one at `-1.09e6`, passes it —
-one candidate is sparse, and the remaining 15 are clean (scale ratio 1.06).
-Removing that one dataset takes the answer from `-85,239 +/- 85,097` to
-`+179 +/- 230`: the error falls by a factor of 370 and the central value moves by
-372 sigma of the new error.
+Worth recording, because an earlier version of this document reached the opposite
+conclusion from exactly this reasoning.
 
-Note also that a fixed-alpha normality test is the wrong instrument regardless,
-because its threshold is about detectability: the fraction that must be removed
-to pass Anderson-Darling *grows* with the number of seeds (measured: ~2% at 50
-datasets, ~12% at 200 for the same contribution). An effect size such as
-`classical sigma / robust sigma` is about twice as stable, but still not fully.
+Looking only at the distribution of per-seed values, the case against removal
+looks strong and is wrong:
 
-## What dokan does instead
+* **"Consistency with the untrimmed estimate" is vacuous.** If one dataset
+  dominates, removing it shifts the mean by ~`(r_i - r_bar)/n` while contributing
+  ~`(r_i - r_bar)^2/n^2` to the variance, so the shift and the error are the same
+  quantity: `|shift|/sigma ~ 1` always. Measured across 24 parts: 0.04 to 1.26. A
+  2-sigma test rejects almost nothing, before or after the k-scan.
+* **"The flagged events carry most of the integral, so removing them changes the
+  answer rather than cleaning it"** inverts the truth. A spurious event dominating
+  its channel is the *symptom*. Measured share of the integral for flagged
+  datasets ran to 374%.
+* **"Remove outliers until the rest is Gaussian"** is not a sufficient test: it
+  constrains what remains, not what was taken. It accepts a 16-dataset part whose
+  single removal moves the result 372 sigma, and its required removal fraction
+  grows with `n` when keyed to a fixed-alpha normality test (~2% at 50 datasets,
+  ~12% at 200), which is the test gaining power, not the tails worsening.
 
-`merge.trim_max_fraction` defaults to **0**: the detector runs and reports,
-nothing is removed. `merge.trim_threshold` (default 8) still sets the robust-z
-above which a dataset is flagged; setting *it* to 0 switches detection off too.
+Each of these is a correct statement about the seed-value distribution. The
+distribution simply does not contain the information that settles the question.
+The kinematics does.
 
-This also removes an accident. Because the cap was a pure fraction, the first
-removal required `ndat >= 1/trim_max_fraction` — 143 datasets at the old 0.007.
-Trimming was therefore off for small parts and on for large ones, a switch on
-statistics rather than on data quality, and campaigns were internally split
-across that line.
+## Settings
 
-`MergePart` logs a per-part summary whenever the detector finds anything:
+```
+trim_threshold      8      robust-z above which a dataset is flagged (0 disables)
+trim_max_fraction   0.05   safety valve: at most max(1, fraction * ndat) removed
+```
+
+`trim_max_fraction` is a **safety valve, not a budget**, and the floor of one
+matters. Written as a bare fraction, the first removal required
+`ndat >= 1/fraction` — 143 datasets at the old default of 0.007 — so trimming
+switched on when a part had accumulated enough statistics rather than when the
+data called for it. A campaign then ran with removal silently active for its
+large parts and inert for the rest, split across that line, with the affected
+parts each losing exactly one dataset regardless of how many were flagged.
+
+The z-score itself is two-sided, computed against the sample's robust scale with
+a separate MAD below and above the median (the distribution is skewed, so a
+one-sided scale would bias rejection toward the longer tail) and weighted by
+`sqrt(neval/<neval>)` so a better-sampled job is held to a tighter tolerance.
+
+Trimmed datasets are pooled into a trailing slot which is marked `INVALID`: they
+are discarded, not down-weighted.
+
+## Diagnostics
+
+`MergePart` reports per part whenever the detector finds anything:
 
 ```
 MergePart[<part>]::run:  outliers flagged in 3 bin(s), up to 5 per bin,
-    worst carrying 97% of the integral (cross); no k-scan plateau in 1 bin(s):
-    more seeds needed
+    worst carrying 97% of the integral (cross); 4 discarded;
+    no k-scan plateau in 1 bin(s): more seeds needed
 ```
 
-Read it as follows.
+* **`carrying X% of the integral`** — how much of the bin the flagged datasets
+  hold. Large values are expected for genuine artifacts, so this is context, not
+  an alarm.
+* **`no k-scan plateau`** — the ladder ran to the fully pooled estimate without
+  its ends agreeing. Paired with a large relative error it means the seed sample
+  cannot resolve the tail: add seeds. On its own it is not necessarily trouble; a
+  part can reach the pooled end and still be precise.
 
-* **`no k-scan plateau`** is the signal worth acting on. The ladder ran to the
-  fully pooled estimate without its ends ever agreeing, which means the seed
-  sample cannot resolve the tail. Paired with a large relative error it says:
-  add seeds. On its own it does not necessarily indicate trouble — a part can
-  reach the pooled end and still be perfectly precise.
-* **`carrying X% of the integral`** is the reason nothing was removed. Near zero,
-  the flagged datasets are noise; of order one, they are the result.
-
-The estimator does recover on its own. One part went from
-`-230,957 +/- 235,129` at 48 datasets to `-1,521 +/- 2,020` at 94, untrimmed:
-the k-scan found its plateau once the seeds arrived.
-
-## Re-enabling removal
-
-Set `trim_max_fraction` to a non-zero value in the runcard's `[Options]`
-(`trim = 8 0.05`) or in `config.json`. Before doing so, check the reported share
-for the parts it would affect: if it is not small, the removal is changing the
-answer rather than cleaning it, and the resulting error bar will not cover the
-difference.
-
-Changing either merge setting is part of the `MergeObs` freshness identity, so
-existing results re-merge automatically; `nnlojet-run finalize RUN --reset`
-forces a full rebuild.
+If a channel is flagged persistently and heavily, the artifacts are worth chasing
+at the source rather than only removing here: the events are reproducible (the
+runs are deterministic, and the seed is named in the diagnostics), so the
+offending configuration can be examined directly.

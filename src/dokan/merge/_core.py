@@ -1021,9 +1021,13 @@ class MergeObs(Task):
                                     _share = abs(float(np.sum(bin_cmlt["sumf"][_cand])) / _tot_f)
                                     diag["max_share"] = max(diag["max_share"], _share)
 
-                            # > trim the most significant offsets first, stopping once we drop below
-                            # > the threshold or reach the maximum fraction of jobs we may trim
-                            max_trim = trim_max_fraction * ndat
+                            # > Trim the most significant offsets first, stopping once we drop below
+                            # > the threshold or reach the safety valve.  The valve is
+                            # > `max(1, fraction * ndat)`: a bare fraction meant the first removal
+                            # > needed `ndat >= 1/fraction` datasets, so trimming switched on with
+                            # > accumulated statistics rather than with the data, and campaigns ran
+                            # > with it silently active for their large parts and inert for the rest.
+                            max_trim = max(1.0, trim_max_fraction * ndat) if trim_max_fraction > 0.0 else 0.0
                             for ntrim, itrim in enumerate(np.argsort(-bin_buf1)):  # most significant first
                                 if bin_buf1[itrim] <= trim_threshold or (ntrim + 1) > max_trim:
                                     break

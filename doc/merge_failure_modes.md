@@ -385,10 +385,11 @@ rejection. Discarding large-weight events is not free either — they can be rea
 contributions that cancel against opposite-sign events of similar size, so
 trimming a small sample can bias the answer rather than clean it.
 
-> **Superseded in part.** Removal is now off by default
-> (`trim_max_fraction = 0`) and the detector reports instead. The reasoning, the
-> measurements, and how to re-enable it are in `outlier_trimming.md`; the
-> discontinuity described below is what the new default removes.
+> **Superseded.** The cap is now `max(1, trim_max_fraction * ndat)`, so the
+> discontinuity described below is gone: removal no longer waits for a part to
+> accumulate `1/fraction` datasets. `outlier_trimming.md` has the evidence that
+> these outliers are matrix-element artifacts rather than physics, and why the
+> question cannot be settled from the seed-value distribution alone.
 
 ### The discontinuity
 

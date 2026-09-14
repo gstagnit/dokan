@@ -127,9 +127,10 @@ _schema: dict = {
         # > robust-z threshold above which a dataset is *flagged* as an outlier.  0
         # > switches detection off entirely, and with it the outlier diagnostics.
         "trim_threshold": float,
-        # > largest fraction of a bin's datasets that may actually be REMOVED.  0 (the
-        # > default) reports outliers without discarding any -- removal cannot be
-        # > validated from the data, see doc/outlier_trimming.md.
+        # > safety valve on removal: at most `max(1, fraction * ndat)` datasets per bin,
+        # > most extreme first.  Not a budget -- the floor of one keeps the decision
+        # > independent of how many datasets have accumulated.  0 reports outliers
+        # > without removing any.  See doc/outlier_trimming.md.
         "trim_max_fraction": float,
         "k_scan_nsteps": int,  # number of scan steps to consider for finding the plateau
         "k_scan_maxdev_steps": float,  # maximum deviation to identify a plateau
