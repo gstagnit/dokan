@@ -97,45 +97,91 @@ The consumption figures are two `SUM`/`COUNT` queries.
 `T_target` from a single pass is a first-order estimate — `MergeFinal` iterates
 it to convergence — hence the `~`.
 
-### Why `T_target` used to read zero
+### Why the runtime-to-target estimate was wrong
 
-The reporting paths cannot solve for the budget they are about to ask for, so
-they call `_distribute_time` with a token one-second `total_t` just to avoid a
-division by zero. That turns out to be a degenerate input. The Euler-Lagrange
-step allocates
+The estimate is a Euler-Lagrange optimum: to reach an absolute accuracy `A`, the
+total runtime wanted is
+
+```
+T_needed = (sum_i sigma_i sqrt(T_i))^2 / A^2  -  sum_i T_i
+```
+
+Everything turns on **which parts belong in those sums**, and that was the bug.
+
+`_distribute_time` first runs an exclusion loop, dropping parts whose optimal
+allocation comes out negative — parts already holding more time than the optimum
+would give them. That set is correct for *allocating* a budget, and it depends on
+the budget. But the reporting paths have no budget to pass: the estimate is what
+they are asking for, so they pass a token one-second `total_t` purely to avoid a
+division by zero. At one second **every** part already holds more than its share,
 
 ```python
 t_opt = (i_err_sqrtt / accum_err_sqrtt) * (total_t + accum_t) - i_t
 ```
 
-and with a one-second budget *every* part already holds more than its share, so
-`t_opt` goes negative and the part is excluded. Iterating, almost everything is
-excluded — measured on a finished run: **179 of 180 parts**. `accum_err_sqrtt`
-and `accum_t` then describe a single part, and
+goes negative almost everywhere, and the loop excludes nearly everything —
+measured on real campaigns, **1 of 180 parts survives**. The sums then describe a
+single part, and the estimate collapses by orders of magnitude.
+
+The first attempt at a fix guarded on `T_target <= 0` and substituted plain
+`1/sqrt(T)` scaling. That caught the case where the collapse happened to land at
+or below zero, and missed the general one: the collapse lands wherever the
+surviving subset puts it, and a small **positive** answer sails straight through
+the guard. A campaign far from its target reported **3.3 kh** of remaining
+runtime when the true figure was above 86 kh.
+
+### The bracket
+
+The estimate is now clamped between two bounds that hold no matter what the
+exclusion set did:
+
+| bound | assumption | why it bounds |
+|---|---|---|
+| lower | the same E-L formula over **every** part | the *unconstrained* optimum, free to take time away from over-resourced parts as reality is not — so it can only be optimistic |
+| upper | no reallocation at all; every part scaled together, total error falling as `1/sqrt(T)` | any allocation does at least this well |
 
 ```python
-T_target = (accum_err_sqrtt / target_abs_acc) ** 2 - accum_t
+t_el     = (accum_err_sqrtt / A) ** 2 - accum_t          # the kept set
+t_el_all = (accum_err_sqrtt_all / A) ** 2 - accum_t_all  # every part
+t_flat   = accum_t_all * ((tot_error / A) ** 2 - 1.0)
+T_target = min(max(t_el, t_el_all), t_flat)
 ```
 
-comes out negative and clamps to zero. The run reported
+Neither bound depends on `total_t`, so a token probe can no longer produce a
+nonsense answer. Replaying two campaigns' part tables through the exclusion loop:
 
-```
-reached rel. acc. 28.2% on cross_hist (requested: 10.0%)
-still require about 0 seconds of runtime to reach desired target accuracy
-```
+| probe budget | parts kept | E-L on kept set | reported before | reported now |
+|---|---|---|---|---|
+| 1 s (what the reports pass) | 1 / 180 | 48 kh | 48 kh | **86 kh** |
+| 500 h (too small) | 2 / 180 | 59 kh | 59 kh | **86 kh** |
+| 86 kh (right scale) | 26 / 180 | 86.7 kh | 86.7 kh | **86.7 kh** |
 
-`MergeFinal`'s refinement loop cannot rescue this either: it re-solves only
-`while T_target / prev_T_target > 1.3`, and seeded with zero it never runs.
+The last row is the one that matters for not breaking anything else. When a
+caller iterates towards a realistic budget — as `MergeFinal`'s refinement loop
+does, re-solving `while T_target / prev_T_target > 1.3` — the E-L answer already
+sits inside the bracket and passes through unchanged, so the sharper constrained
+number still wins. The clamp bites only when the accumulators cannot be trusted.
+Note also that 86 kh in gives 86.7 kh out: at the right scale the estimate is
+close to a fixed point, so refinement converges in about one step.
 
-`_distribute_time` now falls back to plain `1/sqrt(T)` scaling of the *reported*
-error across *all* parts whenever the E-L estimate degenerates to zero while the
-error is still above target. That has no exclusion set to collapse. It is an
-upper bound — it credits nothing to reallocating time between parts — but a
-conservative estimate is the right kind of wrong for a "you still need about X"
-statement, and it gives the refinement loop a sensible seed so the sharper E-L
-answer takes over on the next pass. On the run above it reports ~345 days of
-runtime (~16600 jobs), consistent with the 7.9x more statistics that closing
-28.2% to 10% demands.
+For a campaign that has **reached** its target both bounds go negative and the
+estimate is zero, as before.
+
+One residual case needs the old fallback. The lower bound can itself be
+non-positive while the target is still out of reach: unconstrained, shifting time
+between parts can close the gap with no new time at all. Reality cannot, so the
+estimate falls back to `t_flat` there — pessimistic, but the right kind of wrong
+for a "you still need about X" statement.
+
+### The estimate is only as good as the error it chases
+
+`A = target_rel_acc * tot_result`, and `tot_result` is a sum over parts with
+large cancellations. A campaign whose total sits near zero because one part is
+badly determined has a target that is *itself* unstable, and no runtime estimate
+against it means much. Read the estimate together with the per-part errors
+(`select name, result, error from part order by abs(error) desc`) — if one part
+carries almost all of `tot_error`, that part, not the budget, is the thing to
+deal with.
 
 ### Units
 

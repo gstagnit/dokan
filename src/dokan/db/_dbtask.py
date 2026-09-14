@@ -684,11 +684,13 @@ class DBTask(Task, metaclass=ABCMeta):
         accum_t: float = 0.0
         accum_err_sqrtt: float = 0.0
         accum_t_all: float = 0.0
+        accum_err_sqrtt_all: float = 0.0
         n_included: int = 0
         while True:
             accum_t = 0.0
             accum_err_sqrtt = 0.0
             accum_t_all = 0.0
+            accum_err_sqrtt_all = 0.0
             n_included = 0
             for part_id, ic in cache.items():
                 if part_id not in result["part"]:
@@ -709,11 +711,12 @@ class DBTask(Task, metaclass=ABCMeta):
                         "i_T": i_t,
                         "i_err_sqrtT": ic["adj_error"] * math.sqrt(i_t),
                     }
-                # > time over *every* part, excluded ones included: the E-L sums below
-                # > drop the excluded parts, but the total time already invested does
-                # > not care which parts the optimiser wants to spend more on, and the
-                # > `T_target` fallback needs it (see the end of this method)
+                # > sums over *every* part, excluded ones included.  The E-L sums below
+                # > drop the excluded parts -- correct for *allocating* a given budget,
+                # > but not for the `T_target` bracket at the end of this method, which
+                # > must not depend on the probe budget the caller happened to pass.
                 accum_t_all += result["part"][part_id]["i_T"]
+                accum_err_sqrtt_all += result["part"][part_id]["i_err_sqrtT"]
                 # > skip excluded parts
                 if result["part"][part_id].get("T_opt", 1.0) > 0.0:
                     n_included += 1
@@ -778,44 +781,64 @@ class DBTask(Task, metaclass=ABCMeta):
         result["tot_adj_error"] = math.sqrt(result["tot_adj_error"])
         result["tot_error_estimate_opt"] = math.sqrt(result["tot_error_estimate_opt"])
 
-        # > use E-L formula to compute a time estimate (beyond T)
-        # > needed to achieve the desired accuracy
-        target_abs_acc: float = abs(self.config["run"]["target_rel_acc"] * result["tot_result"])
-        result["T_target"] = (
-            (accum_err_sqrtt / target_abs_acc) ** 2 - accum_t if target_abs_acc > 0.0 else 0.0
-        )
-        self._debug(
-            session,
-            f"DBTask::_distribute_time: tot_result = {result['tot_result']}, "
-            f"{target_abs_acc=}, T_target={result['T_target']}",
-        )
-        result["T_target"] = max(0.0, result["T_target"])
-
-        # > The estimate above is only meaningful when this call was solving for a
-        # > budget of roughly the right size.  The reporting paths cannot do that --
-        # > they ask for the estimate itself, so they pass a token `total_t` to avoid
-        # > dividing by zero -- and the E-L step then excludes nearly every part,
-        # > since with a one-second budget each already holds more than its share
-        # > (`t_opt = share * (total_t + accum_t) - i_t` goes negative).  `accum_*`
-        # > collapse to the one surviving part and `T_target` reads 0 however far the
-        # > run is from its target.  It also defeats the caller's refinement loop,
-        # > which re-solves only `while T_target / prev_T_target > 1.3`: seeded with
-        # > zero, it never iterates.
+        # > Estimate the *additional* runtime needed to reach the target accuracy.
         # >
-        # > Fall back to plain 1/sqrt(T) scaling of the *reported* error over *all*
-        # > parts, which has no such failure mode.  It is an upper bound -- it credits
-        # > nothing to reallocating time between parts -- but a conservative estimate
-        # > is the right kind of wrong here, and it gives the refinement loop a
-        # > sensible seed so the E-L answer takes over on the next pass.
-        if result["T_target"] <= 0.0 and target_abs_acc > 0.0 and result["tot_error"] > target_abs_acc:
-            result["T_target"] = accum_t_all * ((result["tot_error"] / target_abs_acc) ** 2 - 1.0)
+        # > The Euler-Lagrange optimum over a set of parts is
+        # >     T_needed = (sum_i sigma_i sqrt(T_i))^2 / A^2 - sum_i T_i
+        # > with A the absolute target accuracy.  Which parts belong in those sums is
+        # > the whole difficulty, and it is why this estimate used to be nonsense.
+        # >
+        # > `accum_*` run over the parts the exclusion loop above kept in play, and
+        # > that set depends on `total_t`.  For allocation that is exactly right.  For
+        # > *this* quantity it is not: the reporting paths cannot pass a budget (the
+        # > estimate is what they are asking for), so they pass a token one-second
+        # > `total_t`, and at that budget every part already holds more than its share
+        # > -- `t_opt = share * (total_t + accum_t) - i_t` goes negative -- so nearly
+        # > all of them are excluded.  The sums then describe a handful of survivors
+        # > and the estimate collapses by orders of magnitude.  Measured on a campaign
+        # > far from its target: 3.3 kh reported against a true need above 86 kh.
+        # >
+        # > Guarding on `T_target <= 0` (an earlier attempt at this) is not enough.
+        # > The collapse does not reliably land at or below zero; it lands wherever the
+        # > surviving subset puts it, and a small *positive* answer sails through.
+        # >
+        # > So bracket it between two bounds that hold whatever the exclusion set did:
+        # >
+        # >   lower -- the same E-L formula over *every* part.  Independent of the
+        # >     probe budget.  It is a lower bound because it is the *unconstrained*
+        # >     optimum: it is free to take time away from over-resourced parts, which
+        # >     reality is not.
+        # >   upper -- no reallocation at all, every part scaled together, so the total
+        # >     error falls as 1/sqrt(T).  Any allocation does at least this well.
+        # >
+        # > The constrained answer lies between the two.  When the exclusion set is
+        # > meaningful (a caller iterating towards a real budget, as `MergeFinal` does)
+        # > `T_el` is already inside the bracket and is used unchanged, so refinement
+        # > still converges on the sharper number.  The clamp only bites when the
+        # > accumulators cannot be trusted.
+        target_abs_acc: float = abs(self.config["run"]["target_rel_acc"] * result["tot_result"])
+        if target_abs_acc <= 0.0:
+            result["T_target"] = 0.0
+        else:
+            t_el: float = (accum_err_sqrtt / target_abs_acc) ** 2 - accum_t
+            t_el_all: float = (accum_err_sqrtt_all / target_abs_acc) ** 2 - accum_t_all
+            t_flat: float = accum_t_all * ((result["tot_error"] / target_abs_acc) ** 2 - 1.0)
+            result["T_target"] = min(max(t_el, t_el_all), t_flat)
+            # > The lower bound may itself be non-positive while the target is still out
+            # > of reach: unconstrained, moving time between parts can close the gap on
+            # > its own.  Reality cannot, so fall back to the bound that assumes no
+            # > reallocation whatsoever -- pessimistic, but the right kind of wrong for
+            # > a "you still need about X" statement.
+            if result["T_target"] <= 0.0 and result["tot_error"] > target_abs_acc:
+                result["T_target"] = t_flat
             self._debug(
                 session,
-                "DBTask::_distribute_time:  E-L estimate degenerate "
-                f"({len(result['part']) - n_included} of {len(result['part'])} parts excluded); "
-                f"falling back to 1/sqrt(T) scaling: T_target={result['T_target']}",
+                f"DBTask::_distribute_time: tot_result = {result['tot_result']}, "
+                f"{target_abs_acc=}, T_target={result['T_target']} "
+                f"(E-L on {n_included}/{len(result['part'])} parts: {t_el}, "
+                f"E-L on all: {t_el_all}, no-realloc: {t_flat})",
             )
-            result["T_target"] = max(0.0, result["T_target"])
+        result["T_target"] = max(0.0, result["T_target"])
 
         # > split up into jobs
         # (T_max_job, T_job, njobs, ntot_job)
