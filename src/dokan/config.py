@@ -75,6 +75,11 @@ _schema: dict = {
         # > submission, warmup included (<=0: derived as `jobs_max_total *
         # > job_max_runtime`, or unlimited when the job count is unlimited too)
         "jobs_max_total_runtime": float,
+        # > how often, in seconds of wall time, to write the per-order results in
+        # > `result/final` while production is running (<=0: only at the end of the
+        # > run, as before).  Only the dynamic production dispatcher triggers this,
+        # > so warmup and pre-production are never interrupted by it.
+        "finalize_interval": float,
         "jobs_max_concurrent": int,  # maximum number of concurrent jobs
         "jobs_batch_size": int,  # size of runs to batch into a single submission
         "jobs_batch_unit_size": int,  # the minimum batch size of a submission

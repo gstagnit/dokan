@@ -707,8 +707,25 @@ class MergePart(DBMerge):
 class MergeAll(DBMerge):
     # > merge all `Part` objects that are currently active
     finalize: bool = luigi.BoolParameter(default=False)  # type: ignore[assignment]
+    # > timestamp of the finalize request.  Purely an identity: Luigi never forgets a
+    # > task it has already run (see doc/luigi_integration.md section 3), so a repeated
+    # > finalize with identical parameters would be skipped as already done.  A fresh
+    # > `fini_tag` makes each request a distinct task, and `complete()` compares it
+    # > against the tag recorded in the marker so an older request stays satisfied.
+    fini_tag: float = luigi.FloatParameter(default=0.0)  # type: ignore[assignment]
 
     priority = 110
+
+    @property
+    def resources(self):  # type: ignore
+        # > every `MergeAll` writes the same `result/<obs>.dat` (and, when finalizing,
+        # > the same `result/final/<order>.<obs>.dat`), so two of them must never run at
+        # > once.  They are distinct Luigi tasks whenever their parameters differ -- the
+        # > plain one `MergePart` yields, the forced one a merge signal yields, the
+        # > periodic finalize -- so nothing else keeps them apart.  An unregistered
+        # > resource defaults to a limit of one and therefore acts as a mutex, the same
+        # > idiom `MergePart` uses per part.
+        return super().resources | {"MergeAll": 1}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -755,6 +772,8 @@ class MergeAll(DBMerge):
             if marker is None:
                 return False
             if self.run_tag > float(marker.get("run_tag", -1.0)):
+                return False
+            if self.fini_tag > float(marker.get("fini_tag", -1.0)):
                 return False
             return bool(marker.get("finalized", False))
 
@@ -1043,6 +1062,7 @@ class MergeAll(DBMerge):
             self._flush_logs(deferred_logs)
             # > re-write marker atomically with finalized flag added
             marker["finalized"] = True
+            marker["fini_tag"] = self.fini_tag
             marker_tmp = self.merge_marker.with_suffix(".json.tmp")
             with marker_tmp.open("w") as marker_file:
                 json.dump(marker, marker_file, indent=2, sort_keys=True)

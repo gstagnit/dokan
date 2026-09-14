@@ -544,6 +544,33 @@ class DBDispatch(DBTask):
         self._safe_commit(session)
         return True
 
+    def _due_periodic_finalize(self, session: Session) -> float:
+        """Return a fresh `fini_tag` when a periodic finalize is due, else 0.0.
+
+        `run.finalize_interval` asks for the per-order results in `result/final` to be
+        refreshed while the run is still going, rather than only once it ends.  Those
+        files are what carry the lower orders (LO, NLO) alongside the full result, and
+        waiting for the end of a long campaign to see them is not useful.
+
+        This lives on the dynamic dispatcher, and that is what keeps it out of warmup:
+        `DBDispatch(id == 0)` is yielded by `Entry` stage 3 only, so pre-production --
+        which runs its own bounded dispatches -- can never trigger one.
+
+        The clock is the newest `SIG_FINI` entry, which the explicit `finalize` CLI path
+        writes too, so a manual finalize also postpones the next automatic one.
+        """
+        interval: float = float(self.config["run"].get("finalize_interval") or 0.0)
+        if interval <= 0.0:
+            return 0.0
+        last = session.scalars(
+            select(Log).where(Log.level == LogLevel.SIG_FINI).order_by(Log.id.desc())
+        ).first()
+        now: float = time.time()
+        if last is not None and (now - last.timestamp) < interval:
+            return 0.0
+        self._logger(session, self._logger_prefix + "::run:  periodic finalize", level=LogLevel.SIG_FINI)
+        return now
+
     def _consume_dispatch_signals(self, session: Session) -> list[luigi.Task]:
         """Consume pending dispatch signals in priority order and return their tasks.
 
@@ -559,6 +586,10 @@ class DBDispatch(DBTask):
                 # > an up-to-date result, not a from-scratch re-merge of every observable
                 # > (that remains the explicit `finalize` CLI path)
                 signal_tasks.append(self.clone(MergeAll, force=True, finalize=True))
+        # > the periodic refresh yields the *same* task, so a signal arriving in the same
+        # > round makes this a no-op rather than a second merge
+        if not signal_tasks and (fini_tag := self._due_periodic_finalize(session)) > 0.0:
+            signal_tasks.append(self.clone(MergeAll, force=True, finalize=True, fini_tag=fini_tag))
         return signal_tasks
 
     def _with_dispatch_continuation(self, tasks: list[luigi.Task]) -> list[luigi.Task]:

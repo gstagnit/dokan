@@ -14,6 +14,7 @@
     "job_fill_max_runtime": false,
     "jobs_max_total": 100,
     "jobs_max_total_runtime": 0,
+    "finalize_interval": 3600,
     "jobs_max_concurrent": 10,
     "jobs_batch_size": 1,
     "jobs_batch_unit_size": 1,

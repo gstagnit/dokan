@@ -347,6 +347,11 @@ def main() -> None:
         "0 derives it from jobs-max-total x job-max-runtime",
     )
     parser_submit.add_argument(
+        "--finalize-interval", type=parse_time_interval, metavar="TIME",
+        help="how often to refresh the per-order results in result/final while production "
+        "runs, with optional units (e.g. \"1h\"); 0 only writes them at the end",
+    )
+    parser_submit.add_argument(
         "--jobs-max-concurrent", type=int, help="maximum number of concurrently running jobs"
     )
     parser_submit.add_argument("--seed-offset", type=int, help="seed offset")
@@ -877,6 +882,8 @@ def main() -> None:
                     config["run"]["jobs_max_total"] = args.jobs_max_total
                 if args.jobs_max_total_runtime is not None:
                     config["run"]["jobs_max_total_runtime"] = args.jobs_max_total_runtime
+                if args.finalize_interval is not None:
+                    config["run"]["finalize_interval"] = max(0.0, args.finalize_interval)
                 if args.jobs_max_concurrent is not None:
                     config["run"]["jobs_max_concurrent"] = args.jobs_max_concurrent
                 if args.seed_offset is not None:
