@@ -104,9 +104,30 @@ through dokan's own worker/scheduler factory:
 | before | 26.9 kB | 400 |
 | after | **0.6 kB** | **1** |
 
-A 98% cut: about 10 GB against 0.2 GB over 400k task instances. It is also ~60x
-faster per call. This was the dominant term in a growth rate measured at ~0.8
-GB/hour on two independent campaigns (5.41 GB at 6h44m, 8.40 GB at 10h36m).
+A 98% cut, and ~60x faster per call.
+
+**It is not, however, what makes a long run grow.** That was the working
+hypothesis and production refuted it: with the fix installed, the orchestrator's
+anonymous heap still grows at 0.86-0.99 GB/hour, against 0.80 GB/hour before —
+unchanged. The arithmetic rules the hypothesis out after the fact: at 26.9 kB per
+task, 0.9 GB/hour needs ~9 task instances per second, which is plausible; at
+0.6 kB it would need ~420 per second, which is not. Since the rate did not move,
+task retention was never the dominant term.
+
+What is known about the real growth: it is anonymous memory in the parent
+(`Anonymous` ~0.84 GB with `Private_Dirty` ~0.03 GB, the rest shared COW into
+every fork), it is linear, and it continues while the run is essentially idle —
+seven log records in ten minutes, no new rows in the log database, and the
+monitor opening a fresh session per refresh. That combination rules out per-task
+retention, log accumulation and a long-lived identity map. The cause is not yet
+identified; finding it wants `tracemalloc` or `gc` object-count sampling from
+inside a running orchestrator, not more inference from `smaps`.
+
+The fix below is still worth having on its own terms — it removes a real
+per-instance cost and a real per-call cost — but **restarting before a long
+campaign's final merge remains the actual mitigation**, and the reason the
+orchestrator's size matters at all is that Luigi forks a process per task
+attempt, so the parent's heap is shared into every one of them.
 
 ### The task history is capped
 
