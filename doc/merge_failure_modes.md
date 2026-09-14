@@ -311,3 +311,86 @@ that is both wide and memory-hungry.
 ## Open items
 
 Nothing outstanding from the failure modes above.
+
+## Heavy-tailed parts: outlier trimming, and why it is mostly not what saves you
+
+Double-real channels produce occasional events whose weight is orders of
+magnitude above the bulk. A single seed can then return a value millions of
+times the channel's true size, with a relative error near 100% — one event
+carrying the whole job.
+
+The merge has a defence: double-MAD trimming (`merge/_core.py`). Per bin it
+takes the median of the per-dataset results, estimates a robust 1-sigma
+separately below and above it (the distribution is skewed, so a two-sided MAD
+avoids biasing rejection towards the longer tail), and forms a neval-weighted
+robust z-score. Datasets above `trim_threshold` (default 8) are candidates.
+
+### The cap makes it a no-op for a typical part
+
+```python
+max_trim = trim_max_fraction * ndat          # default 0.007
+for ntrim, itrim in enumerate(np.argsort(-bin_buf1)):
+    if bin_buf1[itrim] <= trim_threshold or (ntrim + 1) > max_trim:
+        break
+```
+
+The loop breaks *before* the first trim unless `max_trim >= 1`, i.e. unless
+
+```
+ndat >= 1 / trim_max_fraction = 143      (at the default 0.007)
+```
+
+`ndat` is the number of seed datasets accumulated for that part, and 0.7% is a
+fraction sized for NNLOJET's own combine, where thousands of files are merged in
+one go. dokan merges per part, incrementally, where `ndat` is tens to low
+hundreds. Below 143 datasets the detector runs, flags the outliers correctly,
+and is then forbidden from removing any of them.
+
+Check where a campaign sits:
+
+```bash
+python3 -c "
+import h5py, glob
+for f in sorted(glob.glob('raw/*.hdf5')):
+    with h5py.File(f,'r',swmr=True) as h:
+        for p in h:
+            if 'cross' in h[p]:
+                nd = int(h[p]['cross'].attrs['ndat_valid'])
+                print(f'{p:10s} ndat={nd:5d}  trims={int(0.007*nd)}')"
+```
+
+### Statistics, not trimming, is what actually stabilises these parts
+
+Worth knowing before reaching for the cap. Measured across two charge-conjugate
+campaigns of the same process, matched part by part on `(contribution, channel
+label)` — the conjugate of `[a,b]` being `[-a,-b]`, since `part_num` is a shared
+index and the *same* `part_num` is a *different* initial state in each:
+
+* violent outliers occur in **both**, at comparable rates (1.2% and 2.4% of
+  datasets above z=8, peak z of 633 and 1132) — they are a property of the
+  double-real subtraction, not of one charge;
+* two parts carrying near-identical spikes (about -9.6e6 at z=633, and -8.6e6 at
+  z=627) merged to `-230,957 +/- 271,892` and `-157 +/- 1,227` respectively;
+* what separated them was `ndat`: 48 against 201.
+
+With enough datasets the k-scan finds a plateau and the spike is diluted. With
+too few it never plateaus, keeps calling `merge_pair()`, and converges on the
+fully pooled estimate — where one event dominates. In the well-sampled case
+trimming had removed exactly **one** dataset of seven flagged, so it was not the
+mechanism doing the work.
+
+The practical reading: a part whose error is orders of magnitude above its
+neighbours is usually under-sampled rather than wrong, and the fix is seeds, not
+rejection. Discarding large-weight events is not free either — they can be real
+contributions that cancel against opposite-sign events of similar size, so
+trimming a small sample can bias the answer rather than clean it.
+
+### The discontinuity
+
+Because the cap is a pure fraction with no floor, a part's central value can move
+discontinuously the first time it crosses `ndat = 143` and a trim becomes
+possible. A campaign in progress is generally split across that line, so parts of
+one merge have had trimming applied and parts have not. Raising
+`trim_max_fraction` in the runcard's `[Options]` (`trim = 8 0.05`) moves the
+threshold rather than removing it; a floor of one trim above some minimum active
+sample would remove it, at the cost of changing central values everywhere.
