@@ -7,5 +7,6 @@ module that defines all the different ways of executing NNLOJET
 from ._exe_config import ExecutionMode, ExecutionPolicy
 from ._exe_data import ExeData
 from ._executor import Executor
+from ._queue import QueueSnapshot, QueueStatus
 
-__all__ = ["ExeData", "ExecutionMode", "ExecutionPolicy", "Executor"]
+__all__ = ["ExeData", "ExecutionMode", "ExecutionPolicy", "Executor", "QueueSnapshot", "QueueStatus"]

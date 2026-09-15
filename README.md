@@ -111,6 +111,21 @@ nnlojet-run doctor my_run_dir
 nnlojet-run doctor my_run_dir --recover
 ```
 
+### 4b. Running without a live orchestrator (cluster backends)
+Instead of keeping `submit` alive for the whole campaign, advance it in rounds
+from a scheduler (`cron`, or `acron` at CERN): every tick reconciles finished
+batch jobs, merges, dispatches what can be dispatched, and exits.
+
+```shell
+# every 20 minutes, e.g. from an (a)crontab
+nnlojet-run tick my_run_dir --quiet
+
+# the job board and the log tail, from anywhere, at any time
+nnlojet-run status my_run_dir
+```
+
+See `doc/tick_mode.md` for the design and the operational details.
+
 ### 5. Finalization
 Merge all results into final grids and tables.
 

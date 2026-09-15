@@ -1,0 +1,136 @@
+{
+ "exe": {
+  "path": "/bin/true",
+  "policy": 2,
+  "policy_settings": {
+   "htcondor_template": "htcondor.template",
+   "htcondor_nretry": 2,
+   "htcondor_retry_delay": 0.0,
+   "htcondor_poll_time": 10.0
+  }
+ },
+ "run": {
+  "order": 0,
+  "histograms": {
+   "cross": {
+    "nx": 0
+   },
+   "tcut_accum": {
+    "nx": 1,
+    "cumulant": -1
+   },
+   "tcut_diff": {
+    "nx": 3
+   },
+   "cross_1j_IFN_osss": {
+    "nx": 0
+   },
+   "ptl_1j_IFN_osss": {
+    "nx": 3
+   },
+   "abs_yl_1j_IFN_osss": {
+    "nx": 3
+   },
+   "abs_yj1_1j_IFN_osss": {
+    "nx": 3
+   },
+   "cross_2j_IFN_osss": {
+    "nx": 0
+   },
+   "ptl_2j_IFN_osss": {
+    "nx": 3
+   },
+   "abs_yl_2j_IFN_osss": {
+    "nx": 3
+   },
+   "abs_yj1_2j_IFN_osss": {
+    "nx": 3
+   },
+   "cross_1j_GHS_osss": {
+    "nx": 0
+   },
+   "ptl_1j_GHS_osss": {
+    "nx": 3
+   },
+   "abs_yl_1j_GHS_osss": {
+    "nx": 3
+   },
+   "abs_yj1_1j_GHS_osss": {
+    "nx": 3
+   },
+   "cross_2j_GHS_osss": {
+    "nx": 0
+   },
+   "ptl_2j_GHS_osss": {
+    "nx": 3
+   },
+   "abs_yl_2j_GHS_osss": {
+    "nx": 3
+   },
+   "abs_yj1_2j_GHS_osss": {
+    "nx": 3
+   }
+  },
+  "opt_target": "cross_hist",
+  "target_rel_acc": 0.02,
+  "job_max_runtime": 3600.0,
+  "job_fill_max_runtime": false,
+  "jobs_max_total": 0,
+  "jobs_max_total_runtime": 1000000000.0,
+  "jobs_max_concurrent": 4,
+  "jobs_batch_unit_size": 1,
+  "seed_offset": 0,
+  "dokan_version": "1.0.2",
+  "name": "WmC_ATLAS_2026",
+  "histograms_single_file": "histos",
+  "template": "template.run",
+  "finalize_interval": 0.0
+ },
+ "ui": {
+  "monitor": true,
+  "refresh_delay": 1.5,
+  "log_level": 20
+ },
+ "process": {
+  "name": "WmJunsym",
+  "channels": {
+   "LO_1": {
+    "string": "1  ! channel: [40,0]",
+    "part": "LO",
+    "part_num": 1,
+    "order": 0
+   },
+   "LO_2": {
+    "string": "2  ! channel: [40,-20]",
+    "part": "LO",
+    "part_num": 2,
+    "order": 0
+   }
+  }
+ },
+ "warmup": {
+  "ncores": 1,
+  "ncall_start": 500,
+  "niter": 2,
+  "min_increment_steps": 2,
+  "max_increment_steps": 2,
+  "fac_increment": 4.0,
+  "max_chi2dof": 1.2,
+  "max_err_rel_var": 0.3,
+  "scaling_window": 0.3
+ },
+ "production": {
+  "ncores": 1,
+  "ncall_start": 100,
+  "niter": 2,
+  "penalty_wrt_warmup": 0.1,
+  "fac_merge_trigger": 1.5,
+  "min_number": 1
+ },
+ "merge": {
+  "trim_threshold": 8.0,
+  "trim_max_fraction": 0.05,
+  "k_scan_nsteps": 3,
+  "k_scan_maxdev_steps": 0.4
+ }
+}

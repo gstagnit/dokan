@@ -34,6 +34,9 @@ _schema: dict = {
         "local_ncores": int,
         # --- HTCONDOR
         "htcondor_id": int,
+        # > the scheduler holding the batch: lxplus-style pools attach every login
+        # > node to its own schedd, so a detached batch must be asked for by name
+        "htcondor_schedd": str,
         "htcondor_template": str,
         "htcondor_ncores": int,
         "htcondor_nretry": int,

@@ -8,6 +8,8 @@ This module defines:
 
 # from luigi.execution_summary import LuigiRunResult
 import argparse
+import datetime
+import json
 import logging
 import multiprocessing
 import os
@@ -50,8 +52,8 @@ from .preproduction import (
 )
 from .runcard import Runcard, RuncardTemplate
 from .scheduler import WorkerSchedulerFactory
+from .tick import Tick, TickLease, campaign_tag, format_report, print_status
 from .util import format_cpu_time, parse_time_interval
-
 
 # > Luigi's console verbosity (its own scale, not dokan's `ui.log_level`): the live
 # > board owns the terminal, so anything below WARNING is unreadable there anyway --
@@ -341,15 +343,19 @@ def main() -> None:
     )
     parser_submit.add_argument("--jobs-max-total", type=int, help="maximum number of jobs")
     parser_submit.add_argument(
-        "--jobs-max-total-runtime", type=parse_time_interval, metavar="TIME",
+        "--jobs-max-total-runtime",
+        type=parse_time_interval,
+        metavar="TIME",
         help="runtime the whole computation may consume, summed over every job of every "
-        "submission and including warmup, with optional units (e.g. \"30000h\"); "
+        'submission and including warmup, with optional units (e.g. "30000h"); '
         "0 derives it from jobs-max-total x job-max-runtime",
     )
     parser_submit.add_argument(
-        "--finalize-interval", type=parse_time_interval, metavar="TIME",
+        "--finalize-interval",
+        type=parse_time_interval,
+        metavar="TIME",
         help="how often to refresh the per-order results in result/final while production "
-        "runs, with optional units (e.g. \"1h\"); 0 only writes them at the end",
+        'runs, with optional units (e.g. "1h"); 0 only writes them at the end',
     )
     parser_submit.add_argument(
         "--jobs-max-concurrent", type=int, help="maximum number of concurrently running jobs"
@@ -427,11 +433,176 @@ def main() -> None:
         "--reset", action="store_true", help="remove all data created/populated by finalization"
     )
 
+    # > subcommand: tick
+    parser_tick = subparsers.add_parser(
+        "tick",
+        help="advance a run by one round without a live orchestrator (run it from cron/acron)",
+        description="Reconcile finished batch jobs, merge, dispatch what can be dispatched, and exit. "
+        "Intended to be run every 15-30 minutes by a scheduler; see doc/tick_mode.md.",
+    )
+    parser_tick.add_argument("run_path", metavar="RUN", help="run directory").complete = _COMPLETE_DIR  # type: ignore[attr-defined]
+    parser_tick.add_argument(
+        "--no-dispatch", action="store_true", help="only reconcile and merge; submit nothing new (drain)"
+    )
+    parser_tick.add_argument(
+        "--reopen",
+        action="store_true",
+        help="demote the dispatch-done / completion signals so a finished campaign continues "
+        "(after raising the budget or lowering the target in config.json)",
+    )
+    parser_tick.add_argument(
+        "--lease-timeout",
+        type=parse_time_interval,
+        metavar="TIME",
+        default=parse_time_interval("3h"),
+        help='age after which another tick\'s lease is considered abandoned (default: "3h")',
+    )
+    parser_tick.add_argument(
+        "--workers", type=int, help="parallel Luigi workers within the tick (default: min(#cores, 8))"
+    )
+    parser_tick.add_argument(
+        "--merge-cores", type=int, help="maximum number of parts merged in parallel (default: min(#cores, 8))"
+    )
+    parser_tick.add_argument(
+        "--jobs-batch-size",
+        type=int,
+        metavar="N",
+        help="seeds of one part per batch-system cluster (default: derived as for `submit`)",
+    )
+    parser_tick.add_argument(
+        "--log-level",
+        type=LogLevel.argparse,
+        choices=list(ll for ll in LogLevel if int(ll) > 0),
+        dest="log_level",
+        help="the logging level for the execution",
+    )
+    parser_tick.add_argument("--quiet", action="store_true", help="print only the one-line summary")
+
+    # > subcommand: status
+    parser_status = subparsers.add_parser("status", help="print the job board and the log tail once")
+    parser_status.add_argument("run_path", metavar="RUN", help="run directory").complete = _COMPLETE_DIR  # type: ignore[attr-defined]
+    parser_status.add_argument(
+        "-n", "--lines", type=int, default=20, help="log records to show (default: 20)"
+    )
+
     # > parse arguments
     args = parser.parse_args()
     if args.action is None:
         parser.print_help()
         sys.exit("please specify a subcommand")
+
+    # > subcommand: status (early exit: read-only)
+    if args.action == "status":
+        try:
+            status_config = Config(path=args.run_path, default_ok=False, check_md5=False)
+        except (FileNotFoundError, RuntimeError) as exc:
+            sys.exit(f"cannot load the run configuration: {exc}")
+        status_config["process"].pop("channels")
+        status_config["ui"]["monitor"] = True
+        state = Path(status_config["run"]["path"]) / "tick.json"
+        status_tag: float = 0.0
+        if state.is_file():
+            try:
+                status_tag = float(json.loads(state.read_text()).get("run_tag") or 0.0)
+            except (OSError, ValueError, AttributeError):
+                status_tag = 0.0
+        print_status(status_config, status_tag, n_log=max(0, args.lines), console=console)
+        sys.exit(0)
+
+    # > subcommand: tick (non-interactive: no prompts, no log clearing, no resurrection pass)
+    if args.action == "tick":
+        try:
+            config = Config(path=args.run_path, default_ok=False)
+        except (FileNotFoundError, RuntimeError) as exc:
+            sys.exit(f"cannot load the run configuration: {exc}")
+        channels = config["process"].pop("channels")
+        if args.exe is not None:
+            config["exe"]["path"] = args.exe
+        if args.log_level is not None:
+            config["ui"]["log_level"] = args.log_level
+        if config["exe"]["policy"] == ExecutionPolicy.LOCAL:
+            sys.exit("tick mode needs a batch system (policy is local); use `submit`")
+        n_cap_cfg = config["run"]["jobs_max_total"]
+        t_cap_cfg = float(config["run"].get("jobs_max_total_runtime") or 0.0)
+        if n_cap_cfg <= 0 and t_cap_cfg <= 0.0:
+            sys.exit(
+                "both jobs_max_total and jobs_max_total_runtime are unlimited: the run "
+                "would have no termination condition (set one of them in config.json)"
+            )
+        # > messages go to the log database (as with the live board) and are echoed below
+        config["ui"]["monitor"] = True
+        config["run"]["detached"] = True
+        run_path: Path = Path(config["run"]["path"])
+        run_tag, created = campaign_tag(run_path)
+
+        # > tables & parts.  A run that was never submitted has no active part yet:
+        # > activate them from the configured order, exactly as `submit` would without
+        # > channel selection.  An initialised run keeps its parts as they are (a
+        # > `submit --channels` selection is not persisted and must not be undone).
+        db_init = DBInit(config=config, channels=channels, run_tag=run_tag, order=config["run"]["order"])
+        with db_init.session as session:
+            nactive_part = session.scalar(select(func.count(Part.id)).where(Part.active.is_(True))) or 0
+        if nactive_part == 0:
+            if not luigi.build(
+                [db_init],
+                worker_scheduler_factory=WorkerSchedulerFactory(),
+                workers=1,
+                local_scheduler=True,
+                log_level="WARNING",
+            ):
+                sys.exit("DBInit failed")
+            with db_init.session as session:
+                nactive_part = session.scalar(select(func.count(Part.id)).where(Part.active.is_(True))) or 0
+            if nactive_part == 0:
+                sys.exit("calculation has no active part?!")
+
+        # > batch size, derived as in `submit`
+        jobs_max = (
+            min(config["run"]["jobs_max_concurrent"], n_cap_cfg)
+            if n_cap_cfg > 0
+            else config["run"]["jobs_max_concurrent"]
+        )
+        batch_size_want = (
+            args.jobs_batch_size
+            if args.jobs_batch_size is not None and args.jobs_batch_size > 0
+            else 2 * (jobs_max // nactive_part) + 1
+        )
+        config["run"]["jobs_batch_size"] = min(
+            max(batch_size_want, config["run"]["jobs_batch_unit_size"]), jobs_max
+        )
+        if config["exe"]["policy"] == ExecutionPolicy.SLURM:
+            config["run"]["jobs_batch_size"] = min(config["run"]["jobs_batch_size"], 1000)
+
+        setup_luigi_logging(run_path / "luigi.log", _LUIGI_CONSOLE_LEVEL)
+
+        lease = TickLease(run_path / "tick.lease", args.lease_timeout)
+        if (reason := lease.acquire()) is not None:
+            console.print(f"tick: skipped ({reason})")
+            sys.exit(0)
+        tick = Tick(config=config, run_tag=run_tag)
+        with tick.session as session:
+            last = session.scalars(select(Log).order_by(Log.id.desc())).first()
+            log_id0: int = last.id if last else 0
+            if created:
+                tick._logger(session, "tick", level=LogLevel.SIG_SUB)
+        try:
+            if args.reopen:
+                tick.reopen()
+            report = tick.run_once(
+                dispatch=not args.no_dispatch, workers=args.workers, merge_concurrent=args.merge_cores
+            )
+        finally:
+            lease.release()
+        if not args.quiet:
+            with tick.session as session:
+                for log in session.scalars(select(Log).where(Log.id > log_id0).order_by(Log.id.asc())):
+                    dt_str = datetime.datetime.fromtimestamp(log.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+                    console.print(
+                        f"[dim][{dt_str}][/dim]({LogLevel(log.level)!r}): {log.message}", highlight=False
+                    )
+        # > plain: this line is what a scheduler's mail or a log file gets to keep
+        print(format_report(report), flush=True)
+        sys.exit(0)
 
     # > subcommand: signal (early exit: no DB init needed)
     if args.action == "signal":
@@ -772,8 +943,7 @@ def main() -> None:
         )
         config["run"]["jobs_max_total_runtime"] = max(0.0, new_total_runtime)
         console.print(
-            "[dim]jobs_max_total_runtime = "
-            f"{format_cpu_time(config['run']['jobs_max_total_runtime'])}[/dim]"
+            f"[dim]jobs_max_total_runtime = {format_cpu_time(config['run']['jobs_max_total_runtime'])}[/dim]"
             if config["run"]["jobs_max_total_runtime"] > 0.0
             else "[dim]jobs_max_total_runtime = 0 (derived from the job count)[/dim]"
         )
@@ -1272,7 +1442,9 @@ def main() -> None:
         want_nofile: int = 10 * nworkers
         soft_nofile, hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
         if soft_nofile != resource.RLIM_INFINITY and soft_nofile < want_nofile:
-            target: int = want_nofile if hard_nofile == resource.RLIM_INFINITY else min(want_nofile, hard_nofile)
+            target: int = (
+                want_nofile if hard_nofile == resource.RLIM_INFINITY else min(want_nofile, hard_nofile)
+            )
             try:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard_nofile))
             except (OSError, ValueError) as err:

@@ -600,9 +600,46 @@ class DBDispatch(DBTask):
             signal_tasks.append(self.clone(MergeAll, force=False, finalize=True, fini_tag=fini_tag))
         return signal_tasks
 
+    @property
+    def detached(self) -> bool:
+        """Tick mode: one dispatch wave, then return (see `doc/tick_mode.md`).
+
+        The live orchestrator stays alive by re-yielding a `DBDispatch(id=0, _n+1)`
+        continuation after every wave and by sleeping while throttled.  A tick does
+        neither: whatever cannot be done without waiting on the batch system is left
+        to the next tick.
+        """
+        return bool(self.config["run"].get("detached", False))
+
     def _with_dispatch_continuation(self, tasks: list[luigi.Task]) -> list[luigi.Task]:
         """Return signal tasks followed by one dynamic dispatch continuation."""
+        if self.detached:
+            return list(tasks)
         return [*tasks, self.clone(DBDispatch, id=0, _n=self._n + 1)]
+
+    def _free_slots(self, session: Session) -> int | None:
+        """Detached only: how many more jobs may be handed to the batch system now.
+
+        Attached, the `jobs_concurrent` Luigi resource is the hard cap on submitted
+        jobs: an executor holds its batch's slots for as long as the batch runs.  A
+        detached executor holds them for the seconds its submission takes, so that
+        resource caps nothing across a tick.  The cap is therefore applied here, on
+        the count the database has after the tick's reconciliation -- which is
+        per-seed accurate, since the reconciliation marks finished seeds of a
+        running batch done.  Rows left QUEUED by the cap are the next tick's first
+        wave (`_repopulate` drains them before planning new ones).
+        """
+        if not self.detached:
+            return None
+        inflight: int = (
+            session.scalar(
+                select(func.count(Job.id))
+                .where(Job.run_tag == self.run_tag)
+                .where(Job.status.in_([JobStatus.DISPATCHED, JobStatus.RUNNING]))
+            )
+            or 0
+        )
+        return max(0, int(self.config["run"]["jobs_max_concurrent"]) - inflight)
 
     def _poll_dispatch_signals_until(self, deadline: float) -> list[luigi.Task]:
         """Poll dispatch signals until ``deadline`` or an actionable signal appears."""
@@ -633,6 +670,14 @@ class DBDispatch(DBTask):
             with self.session as session:
                 queue_full = self._repopulate(session)
             if queue_full:
+                if self.detached:
+                    # > throttled: nothing to do that does not involve waiting for the
+                    # > batch system, so the tick is over for this dispatcher
+                    with self.session as session:
+                        self._logger(
+                            session, self._logger_prefix + "::run:  throttled, leaving to the next tick"
+                        )
+                    return
                 # > only dynamic dispatch (id == 0) can be throttled: bounded dispatch
                 # > (`id > 0`) returns from `_repopulate` immediately with False
                 signal_tasks = self._poll_dispatch_signals_until(time.monotonic() + self._dispatch_interval())
@@ -644,7 +689,15 @@ class DBDispatch(DBTask):
         done: bool = False
         with self.session as session:
             self._debug(session, self._logger_prefix + "::run:  " + f"part_id = {self.part_id}")
+            free_slots: int | None = self._free_slots(session)
             while True:
+                if free_slots is not None and free_slots <= 0:
+                    self._logger(
+                        session,
+                        self._logger_prefix
+                        + "::run:  concurrency limit reached, leaving the rest to the next tick",
+                    )
+                    break
                 _ = self._repopulate(session)
 
                 # > repopulate returned without selecting a part: nothing left to
@@ -689,6 +742,12 @@ class DBDispatch(DBTask):
                         if nbatch == 0:
                             nbatch = nbatch_curr  # dispatch the partial batch rather than stalling
                         jobs = jobs[:nbatch]
+                    if free_slots is not None:
+                        # > detached: never exceed the concurrency limit across ticks; a
+                        # > warmup step is one batch and is dispatched whole (`id > 0`)
+                        if self.id == 0:
+                            jobs = jobs[:free_slots]
+                        free_slots -= len(jobs)
 
                 # > set seeds for the jobs to prepare for a dispatch
                 if jobs:
@@ -742,8 +801,7 @@ class DBDispatch(DBTask):
                 njobs: int = sum(len(r.ids) for r in runners)
                 self._logger(
                     session,
-                    self._logger_prefix
-                    + f"::run:  dispatched {njobs} job(s) in {len(runners)} batch(es)",
+                    self._logger_prefix + f"::run:  dispatched {njobs} job(s) in {len(runners)} batch(es)",
                 )
             else:
                 self._debug(session, self._logger_prefix + "::run:  nothing to dispatch")
@@ -756,7 +814,7 @@ class DBDispatch(DBTask):
                 signal_tasks = self._consume_dispatch_signals(session)
             if signal_tasks:
                 next_tasks.extend(self._with_dispatch_continuation(signal_tasks))
-            elif not done:
+            elif not done and not self.detached:
                 # > nothing new to dispatch but the workflow is not finished yet
                 # > (active jobs still draining after the dispatch-done signal): pace
                 # > the continuation so the chain polls instead of busy-spinning.

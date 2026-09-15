@@ -85,6 +85,10 @@ _schema: dict = {
         "jobs_batch_unit_size": int,  # the minimum batch size of a submission
         "seed_offset": int,  # seed number offset
         "timestamps": float,  # @todo list of timestamps when `run` was called
+        # > tick-time only (`nnlojet-run tick`): executors submit and return instead
+        # > of tracking, the dispatcher performs one wave and returns instead of
+        # > re-yielding itself.  Never persisted.
+        "detached": bool,
     },
     "ui": {
         "monitor": bool,  # flag to switch on/off the live monitor
@@ -147,6 +151,7 @@ _deprecated: list[tuple[str, str]] = [
 # > pruned on load and stripped on write so they can never become persistent
 _transient: list[tuple[str, str]] = [
     ("warmup", "skip_qc"),  # `submit --no-warmup`
+    ("run", "detached"),  # `tick`
 ]
 
 # > sentinel to tell "key absent" apart from "key present with a falsy value"

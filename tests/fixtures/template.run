@@ -1,0 +1,178 @@
+!###############################################!
+!##                                           ##!
+!##     _  ___  ____   ____     ____________  ##!
+!##    / |/ / |/ / /  / __ \__ / / __/_  __/  ##!
+!##   /    /    / /__/ /_/ / // / _/  / /     ##!
+!##  /_/|_/_/|_/____/\____/\___/___/ /_/      ##!
+!##                                           ##!
+!##                                RUNCARD    ##!
+!###############################################!
+
+PROCESS  WmJunsym
+  collider = pp  sqrts = 13000
+  jet = antikt[0.4] jet_exclusive = .false.  jet_recomb = V4
+  decay_type = 1
+  !jet_flavour = revised_flavour_dressing[keep_even_tag=.true.]
+  jet_flavour = none
+END_PROCESS
+
+FASTJET
+  IFN = flavifn[R=0.4,palg=2]
+  GHS = flavghs[R=0.4,palg=2,ptcut=20.0]
+END_FASTJET
+
+RUN  WmC_ATLAS_2026
+  PDF              = PDF4LHC21_mc[0]
+  tcut             = 1d-10
+  angular_average  = .true.
+  multi_channel    = 1
+  tag_flavour      = 4
+  ${sweep}
+  ${run}
+END_RUN
+
+PARAMETERS
+  ! PDG (2020) values
+  GF = 1.16638d-5
+  MASS[Z,OS]   = 91.1876
+  WIDTH[Z,OS]  = 2.4952
+  MASS[W,OS]   = 80.379
+  WIDTH[W,OS]  = 2.085
+  MASS[b]   = 0
+  MASS[c]   = 0
+  SCHEME[MASS_V] = POLE
+  SCHEME[WIDTH_V] = COMPLEX_MASS_SCHEME
+  SCHEME[ALPHA] = GMU[ABS]
+  CKM = FULL !FULL or UNITY
+END_PARAMETERS
+
+SELECTORS
+  select ptlm            min = 27.0
+  select abs_ylm         max = 2.5
+  select jets_pt         min = 20.0
+  select jets_abs_y      max = 2.5
+  select njets           min = 1
+  select jets_min_dr_lj  min = 0.4
+  ! missing dR(soft muon,jet) < 0.4
+  ! no cut on MET or mT(W)
+  !! we require at least one flav algo from any algo
+  OR
+    select IFN_flav_njets min = 1
+    select GHS_flav_njets min = 1
+  END_OR
+END_SELECTORS
+
+
+HISTOGRAMS > histos
+
+  !OS-SS
+  !only one flavoured jet (bin Njets == 1 e Njets == 2)
+  !! - soft-muon rapidity (0.0, 2.5, 10 bins)
+
+  smin_over_shat > tcut_accum  min = 1d-10  max = 1  nbins = 20  binning = log  cumulant = -1
+  smin_over_shat > tcut_diff   min = 1d-10  max = 1  nbins = 20  binning = log
+
+  cross > cross_1j_IFN_osss   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  ptlm > ptl_1j_IFN_osss      nbins = 36   min = 27.d0   max = 207.d0   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  abs_ylm > abs_yl_1j_IFN_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  IFN_flav_abs_yj1 > abs_yj1_1j_IFN_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+
+  cross > cross_2j_IFN_osss   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  ptlm > ptl_2j_IFN_osss      nbins = 36   min = 27.d0   max = 207.d0   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  abs_ylm > abs_yl_2j_IFN_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  IFN_flav_abs_yj1 > abs_yj1_2j_IFN_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*IFN_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select IFN_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+
+  cross > cross_1j_GHS_osss   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  ptlm > ptl_1j_GHS_osss      nbins = 36   min = 27.d0   max = 207.d0   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  abs_ylm > abs_yl_1j_GHS_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  GHS_flav_abs_yj1 > abs_yj1_1j_GHS_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 1 max = 1
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+
+  cross > cross_2j_GHS_osss   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  ptlm > ptl_2j_GHS_osss      nbins = 36   min = 27.d0   max = 207.d0   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  abs_ylm > abs_yl_2j_GHS_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+  GHS_flav_abs_yj1 > abs_yj1_2j_GHS_osss  nbins = 10   min = 0.d0   max = 2.5d0   fac = 1.0*GHS_flav_signj1
+  HISTOGRAM_SELECTORS
+    select njets           min = 2 max = 2
+    select GHS_flav_njets  min = 1 max = 1
+  END_HISTOGRAM_SELECTORS
+
+END_HISTOGRAMS
+
+SCALES
+  ! Assign dynamic scales
+  muf =       etw   mur =       etw
+  muf =       etw   mur = 2.0 * etw
+  muf =       etw   mur = 0.5 * etw
+  !> 2 * muf
+  muf = 2.0 * etw   mur =       etw
+  muf = 2.0 * etw   mur = 2.0 * etw
+  !> 2 * mur
+  muf = 0.5 * etw   mur =       etw
+  muf = 0.5 * etw   mur = 0.5 * etw
+END_SCALES
+
+CHANNELS  ${channels_region}
+  ${channels}
+END_CHANNELS
+
+${toplevel}

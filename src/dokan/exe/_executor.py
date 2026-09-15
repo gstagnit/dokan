@@ -20,6 +20,7 @@ from .._types import GenericPath
 from ..db._loglevel import LogLevel
 from ._exe_config import ExecutionMode, ExecutionPolicy
 from ._exe_data import ExeData
+from ._queue import QueueSnapshot, QueueStatus
 
 
 class LogLevelParameter(luigi.OptionalIntParameter):
@@ -70,6 +71,12 @@ class Executor(luigi.Task, metaclass=ABCMeta):
     path: str = luigi.Parameter()  # type: ignore[assignment]
     log_level: LogLevel = LogLevelParameter(default=LogLevel.INFO)  # type: ignore[assignment]
     priority_bump: int = luigi.IntParameter(default=0)  # type: ignore[assignment]
+    # > Detached execution (`nnlojet-run tick`): `run()` submits the batch and returns
+    # > instead of tracking it to completion.  The batch is then reconciled later --
+    # > by another process, possibly on another host -- through the queue API below
+    # > (`queue_snapshot`, `seeds_in_queue`) and `finish()`.  Only cluster policies
+    # > support this; a policy that cannot be detached raises in `run()`.
+    detached: bool = luigi.BoolParameter(default=False)  # type: ignore[assignment]
 
     _priority_default: ClassVar[int] = 100
 
@@ -297,17 +304,96 @@ class Executor(luigi.Task, metaclass=ABCMeta):
         """
         return [luigi.LocalTarget(self.exe_data.file_fin)]
 
+    def complete(self) -> bool:
+        """Attached: the final `job.json` exists.  Detached: the batch is submitted.
+
+        A detached executor's job is done once the batch is *in the queue*; its
+        outputs are collected by a later `finish()`.  Re-read from disk rather than
+        trusting `self.exe_data`: this instance may have been built in the parent
+        before a child process performed the submission.
+        """
+        if not self.detached:
+            return super().complete()
+        exe_data = ExeData(Path(self.path))
+        return exe_data.is_final or self.is_submitted(exe_data)
+
     @abstractmethod
     def exe(self) -> None:
         """Execute the backend-specific workload.
 
         Subclasses are expected to:
-        - submit/track work on their respective backend,
+        - submit/track work on their respective backend (submit only when
+          `self.detached`),
         - update `self.exe_data` as needed (for example scheduler ids),
         - return without raising for expected job failures (those are detected
           from output parsing), and raise only for task-level faults.
         """
         raise NotImplementedError("Executor::exe: abstract method must be overridden!")
+
+    # ---------------------------------------------------------------------------
+    # > queue API (detached execution).  Cluster backends override all of these.
+    # ---------------------------------------------------------------------------
+
+    def is_submitted(self, exe_data: ExeData | None = None) -> bool:
+        """Whether the batch carries a batch-system handle (i.e. `exe()` submitted it)."""
+        return False
+
+    @classmethod
+    def queue_snapshot(cls, exe_datas: list[ExeData], log: Callable[[str, LogLevel], None]) -> QueueSnapshot:
+        """Query the batch system once for everything of ours it still holds.
+
+        `exe_datas` are the in-flight batches the caller is about to reconcile; a
+        backend with several schedulers uses them to decide which ones to ask.
+        Raises when the batch system cannot be queried: a reconciliation must never
+        proceed on a guess, since "not in the queue" means "finished".
+        """
+        raise NotImplementedError(f"{cls.__name__} cannot be detached (no batch system to query)")
+
+    def seeds_in_queue(self, snapshot: QueueSnapshot) -> dict[int, QueueStatus] | None:
+        """`{seed: status}` of this batch's jobs still in the queue; None when not queued at all.
+
+        An empty dict therefore means "submitted and gone", i.e. every seed has
+        terminated one way or another.
+        """
+        raise NotImplementedError(f"{type(self).__name__} cannot be detached (no batch system to query)")
+
+    def adopt_submission(self, snapshot: QueueSnapshot) -> bool:
+        """Recover the batch handle of a submission whose id was never written back.
+
+        A crash between the submit command and the `ExeData` write leaves a batch
+        that is in the queue but looks unsubmitted; re-submitting it would run every
+        seed twice.  The queue snapshot identifies it by working directory.  Returns
+        True when the handle was recovered (and persisted).
+        """
+        return False
+
+    def release_held(self, snapshot: QueueSnapshot) -> int:
+        """Release this batch's held jobs, if any; returns how many were held."""
+        return 0
+
+    # ---------------------------------------------------------------------------
+
+    def stage(self) -> None:
+        """Pick up whatever is already on disk and stamp the execution."""
+        self.exe_data.scan_dir([self._file_log])
+        if "timestamp" not in self.exe_data:
+            self.exe_data["timestamp"] = time.time()
+        self.exe_data.write()
+
+    def finish(self) -> None:
+        """Collect the outputs of a batch the backend no longer holds, and finalize.
+
+        The second half of an attached `run()`, callable on its own for a detached
+        batch once `seeds_in_queue` reports it gone.  Idempotent: finalizing a final
+        `ExeData` is a no-op and the grid adaption skips already adapted grids.
+        """
+        if self.exe_data.is_final:
+            return
+        self.exe_data.scan_dir([self._file_log], fs_max_retry=self.FS_MAX_RETRY, fs_delay=self.FS_DELAY)
+        # > warmup: fold the seeds' grid data into the grid state (no re-scan afterwards:
+        # > the `.bak` left behind must not become a tracked output that propagates)
+        self.adapt_warmup_grids(self.exe_data, self._logger)
+        self.exe_data.finalize()
 
     def run(self) -> None:
         """Run the execution task.
@@ -319,6 +405,12 @@ class Executor(luigi.Task, metaclass=ABCMeta):
         4. Re-scanning outputs, combining warmup grid data (`--adapt`), and
            finalizing to `job.json`.
 
+        Detached (`self.detached`): step 3 only *submits* and steps 4 are left to a
+        later `finish()`, unless the recovery scan of step 1 already found every
+        result, in which case the batch is finalized right away.  A detached
+        submission that fails is a task failure: the batch stays staged on disk and
+        the next tick re-submits it.
+
         Notes
         -----
         - If recovery scanning already finds all job results, backend execution
@@ -326,26 +418,23 @@ class Executor(luigi.Task, metaclass=ABCMeta):
         - Finalization is always attempted so downstream tasks can rely on an
           immutable final state file.
         """
-        # > more preparation for execution?
-
-        # > scan directory and update ExeData (recovery mode)
-        self.exe_data.scan_dir([self._file_log])
-        if "timestamp" not in self.exe_data:
-            self.exe_data["timestamp"] = time.time()
-        self.exe_data.write()
+        self.stage()
 
         if not self.exe_data.is_complete:
-            # > call the backend specific execution
-            try:
-                self.exe()
-            except Exception as e:
-                self._logger(f"exception in exe: {e}", level=LogLevel.ERROR)
-                raise
+            if self.detached and self.is_submitted():
+                self._logger("Executor::run: already submitted, detached", level=LogLevel.DEBUG)
+            else:
+                # > call the backend specific execution
+                try:
+                    self.exe()
+                except Exception as e:
+                    self._logger(f"exception in exe: {e}", level=LogLevel.ERROR)
+                    raise
+            if self.detached:
+                if not self.is_submitted():
+                    raise RuntimeError(f"detached submission failed for {self.path}")
+                return
         else:
             self._logger("Executor::run: skipped exe()", level=LogLevel.DEBUG)
 
-        self.exe_data.scan_dir([self._file_log], fs_max_retry=self.FS_MAX_RETRY, fs_delay=self.FS_DELAY)
-        # > warmup: fold the seeds' grid data into the grid state (no re-scan afterwards:
-        # > the `.bak` left behind must not become a tracked output that propagates)
-        self.adapt_warmup_grids(self.exe_data, self._logger)
-        self.exe_data.finalize()
+        self.finish()

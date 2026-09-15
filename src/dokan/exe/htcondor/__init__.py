@@ -9,11 +9,43 @@ import re
 import string
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from ..._types import GenericPath
 from ...db._loglevel import LogLevel
+from .._exe_data import ExeData
 from .._executor import Executor
+from .._queue import QueueSnapshot, QueueStatus
+
+# > HTCondor `JobStatus` codes -> what dokan cares about.  Removed (3) and
+# > Completed (4) jobs linger in the queue for a moment after they finish; while
+# > they are listed they still count as "not yet gone", which errs on the safe side.
+_CONDOR_STATUS: dict[int, QueueStatus] = {
+    1: QueueStatus.IDLE,
+    2: QueueStatus.RUNNING,
+    5: QueueStatus.HELD,
+}
+
+# > the schedd this process submits to, resolved once per process
+_LOCAL_SCHEDD: str | None = None
+
+
+def _local_schedd() -> str:
+    """Name of the schedd `condor_submit` talks to here ("" when unknown).
+
+    Pools like CERN's attach every login node to one of several schedds, so a
+    `condor_q` issued elsewhere does not see what was submitted here.  The name is
+    recorded with every detached submission and the query is directed at it.
+    """
+    global _LOCAL_SCHEDD
+    if _LOCAL_SCHEDD is None:
+        try:
+            out = subprocess.run(["condor_config_val", "SCHEDD_HOST"], capture_output=True, text=True)
+            _LOCAL_SCHEDD = out.stdout.strip() if out.returncode == 0 else ""
+        except OSError:
+            _LOCAL_SCHEDD = ""
+    return _LOCAL_SCHEDD
 
 
 class HTCondorExec(Executor):
@@ -48,13 +80,195 @@ class HTCondorExec(Executor):
         template_list: list[str] = ["htcondor.template", "lxplus.template"]
         return [Path(__file__).parent.resolve() / t for t in template_list]
 
+    # ---------------------------------------------------------------------------
+    # > queue API (detached execution)
+    # ---------------------------------------------------------------------------
+
+    def is_submitted(self, exe_data: ExeData | None = None) -> bool:
+        settings: dict = (exe_data if exe_data is not None else self.exe_data).get("policy_settings", {})
+        return int(settings.get("htcondor_id", 0) or 0) > 0
+
+    @property
+    def _start_seed(self) -> int:
+        return min(int(job["seed"]) for job in self.exe_data["jobs"].values())
+
+    @staticmethod
+    def _condor_q(
+        args: list[str], nretry: int, retry_delay: float, log: Callable[[str, LogLevel], None]
+    ) -> list[tuple[str, int, int, int, str]]:
+        """`(schedd, cluster, proc, status, iwd)` for every job `condor_q args` lists.
+
+        Retries with the same backoff as the tracker; raises once the retries are
+        exhausted, because a reconciliation must not mistake "could not ask" for
+        "nothing there".
+        """
+        cmd: list[str] = ["condor_q", *args, "-nobatch", "-af:t", "GlobalJobId", "JobStatus", "Iwd"]
+        last: str = ""
+        for iretry in range(max(1, nretry)):
+            try:
+                condor_q = subprocess.run(cmd, capture_output=True, text=True)
+            except OSError as exc:
+                raise RuntimeError(f"cannot run condor_q: {exc}") from exc
+            if condor_q.returncode == 0:
+                rows: list[tuple[str, int, int, int, str]] = []
+                for line in condor_q.stdout.splitlines():
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) < 3:
+                        continue
+                    # > GlobalJobId = "<schedd>#<cluster>.<proc>#<submit time>"
+                    match = re.match(r"^([^#]+)#(\d+)\.(\d+)#", fields[0])
+                    if not match:
+                        continue
+                    try:
+                        status: int = int(fields[1])
+                    except ValueError:
+                        continue
+                    rows.append((match.group(1), int(match.group(2)), int(match.group(3)), status, fields[2]))
+                return rows
+            last = f"{condor_q.stdout}\n{condor_q.stderr}"
+            log(
+                f"HTCondorExec: condor_q {' '.join(args)} failed (attempt {iretry + 1}/{nretry}):\n{last}",
+                LogLevel.INFO,
+            )
+            time.sleep(retry_delay * 1.5**iretry)
+        raise RuntimeError(f"condor_q {' '.join(args)} failed after {nretry} attempt(s):\n{last}")
+
+    @classmethod
+    def queue_snapshot(cls, exe_datas: list[ExeData], log: Callable[[str, LogLevel], None]) -> QueueSnapshot:
+        """One `condor_q` per schedd that holds any of `exe_datas`, plus the local one.
+
+        Batches that predate the schedd bookkeeping (submitted by the live
+        orchestrator) can be on any schedd of the pool; for those one `-global`
+        query is added.  A failing `-global` is not fatal -- it only disables the
+        reconciliation of exactly those batches (`seeds_in_queue` raises for them)
+        -- whereas a named schedd that cannot be reached fails the snapshot.
+        """
+        nretry: int = 3
+        retry_delay: float = 10.0
+        schedds: set[str] = set()
+        legacy: bool = False
+        for exe_data in exe_datas:
+            settings: dict = exe_data.get("policy_settings", {})
+            if int(settings.get("htcondor_id", 0) or 0) <= 0:
+                continue
+            nretry = max(nretry, int(settings.get("htcondor_nretry", nretry) or nretry))
+            retry_delay = float(settings.get("htcondor_retry_delay", retry_delay) or retry_delay)
+            schedd: str = str(settings.get("htcondor_schedd", "") or "")
+            if schedd:
+                schedds.add(schedd)
+            else:
+                legacy = True
+        if local := _local_schedd():
+            schedds.add(local)
+
+        snapshot = QueueSnapshot()
+        seen: set[tuple[str, int, int]] = set()
+
+        def ingest(rows: list[tuple[str, int, int, int, str]]) -> None:
+            for schedd, cluster, proc, status, iwd in rows:
+                if (schedd, cluster, proc) in seen:
+                    continue
+                seen.add((schedd, cluster, proc))
+                snapshot.add(
+                    iwd,
+                    proc,
+                    _CONDOR_STATUS.get(status, QueueStatus.OTHER),
+                    batch_id=cluster,
+                    scheduler=schedd,
+                )
+
+        for schedd in sorted(schedds):
+            ingest(cls._condor_q(["-name", schedd], nretry, retry_delay, log))
+            snapshot.queried.append(schedd)
+        if legacy:
+            try:
+                ingest(cls._condor_q(["-global"], nretry, retry_delay, log))
+                snapshot.queried.append("-global")
+            except RuntimeError as exc:
+                log(
+                    "HTCondorExec: condor_q -global failed; batches without a recorded schedd"
+                    f" are skipped: {exc}",
+                    LogLevel.WARN,
+                )
+        if not schedds and not legacy:
+            # > nothing recorded and no local schedd name: the plain default query
+            ingest(cls._condor_q([], nretry, retry_delay, log))
+            snapshot.queried.append("(default)")
+        return snapshot
+
+    def _snapshot_covers(self, snapshot: QueueSnapshot) -> bool:
+        """Whether `snapshot` asked the schedd this batch was submitted to."""
+        schedd: str = str(self.exe_data["policy_settings"].get("htcondor_schedd", "") or "")
+        if schedd:
+            return schedd in snapshot.queried
+        return "-global" in snapshot.queried or "(default)" in snapshot.queried
+
+    def seeds_in_queue(self, snapshot: QueueSnapshot) -> dict[int, QueueStatus] | None:
+        key: str | None = snapshot.lookup(self.exe_data.path)
+        if key is not None:
+            start: int = self._start_seed
+            return {start + proc: status for proc, status in snapshot.jobs[key].items()}
+        if not self.is_submitted():
+            return None
+        if not self._snapshot_covers(snapshot):
+            raise LookupError(
+                f"batch {self.exe_data.path} is on a schedd the snapshot did not cover"
+                f" ({self.exe_data['policy_settings'].get('htcondor_schedd') or 'unrecorded'})"
+            )
+        return {}
+
+    def adopt_submission(self, snapshot: QueueSnapshot) -> bool:
+        if self.is_submitted():
+            return False
+        key: str | None = snapshot.lookup(self.exe_data.path)
+        if key is None:
+            return False
+        self.exe_data["policy_settings"]["htcondor_id"] = snapshot.batch_id[key]
+        if schedd := snapshot.scheduler.get(key):
+            self.exe_data["policy_settings"]["htcondor_schedd"] = schedd
+        self.exe_data.write()
+        self._logger(
+            f"HTCondorExec adopted cluster {snapshot.batch_id[key]} found in the queue", LogLevel.WARN
+        )
+        return True
+
+    def release_held(self, snapshot: QueueSnapshot) -> int:
+        seeds = self.seeds_in_queue(snapshot)
+        n_held: int = sum(1 for status in (seeds or {}).values() if status == QueueStatus.HELD)
+        if n_held == 0:
+            return 0
+        cluster: int = int(self.exe_data["policy_settings"]["htcondor_id"])
+        cmd: list[str] = ["condor_release"]
+        if schedd := self.exe_data["policy_settings"].get("htcondor_schedd"):
+            cmd += ["-name", str(schedd)]
+        cmd.append(str(cluster))
+        condor_release = subprocess.run(cmd, capture_output=True, text=True)
+        self._logger(
+            (
+                "HTCondorExec released held jobs"
+                if condor_release.returncode == 0
+                else "HTCondorExec failed to release held jobs"
+            )
+            + f" [dim](job_id={cluster}, held={n_held})[/dim]"
+            + (
+                ""
+                if condor_release.returncode == 0
+                else f":\n{condor_release.stdout}\n{condor_release.stderr}"
+            ),
+            LogLevel.INFO,
+        )
+        return n_held
+
+    # ---------------------------------------------------------------------------
+
     def exe(self):
         # > recovery mode
         if (
             "htcondor_id" in self.exe_data["policy_settings"]
             and self.exe_data["policy_settings"]["htcondor_id"] > 0
         ):
-            self._track_job()
+            if not self.detached:
+                self._track_job()
             return
 
         # > populate the submission template file
@@ -88,6 +302,10 @@ class HTCondorExec(Executor):
             if condor_submit.returncode == 0 and (match_id := re.match(re_cluster_id, condor_submit.stdout)):
                 cluster_id = int(match_id.group(1))
                 self.exe_data["policy_settings"]["htcondor_id"] = cluster_id
+                # > which schedd took it: a detached reconciliation may run on another
+                # > login node, whose default schedd is a different one
+                if schedd := _local_schedd():
+                    self.exe_data["policy_settings"]["htcondor_schedd"] = schedd
                 self.exe_data.write()
                 break
             else:
@@ -105,6 +323,10 @@ class HTCondorExec(Executor):
                 LogLevel.WARN,
             )
             return  # failed job
+
+        if self.detached:
+            self._logger(f"HTCondorExec submitted cluster {cluster_id} [dim](detached)[/dim]", LogLevel.DEBUG)
+            return
 
         # > now we need to track the job
         self._track_job()

@@ -370,16 +370,29 @@ class DBRunner(DBTask):
         if job_status == JobStatus.DISPATCHED and not exe_data.is_final:
             self._prepare_execution(exe_data)
 
+        detached: bool = bool(self.config["run"].get("detached", False))
         yield Executor.factory(
             policy=self.policy,
             path=str(self.job_path.absolute()),
             log_level=self.config["ui"]["log_level"],
+            detached=detached,
         )
 
         # > parse the return data (reached once the executor is complete; a fresh
         # > run() attempt restarts from the top and falls through the yield inline)
         exe_data.load()
         if not exe_data.is_final:
+            if detached:
+                # > a detached executor is complete once the batch is submitted; the
+                # > results are collected by a later tick's reconciliation, which also
+                # > performs the DB update and the merge decision below
+                with self.session as session:
+                    self._logger(
+                        session,
+                        self._logger_prefix
+                        + f"::run:  batch {self.job_path.name} submitted [dim](detached)[/dim]",
+                    )
+                return
             # > even failed jobs should finalize ExeData
             raise RuntimeError(f"{self.ids} not final?!\n{self.job_path}\n{exe_data.data}")
 
@@ -417,8 +430,7 @@ class DBRunner(DBTask):
                 else:
                     self._logger(
                         session,
-                        self._logger_prefix
-                        + f"::run:  {len(self.ids)} job(s) finished -> merging part",
+                        self._logger_prefix + f"::run:  {len(self.ids)} job(s) finished -> merging part",
                     )
                     mrg_part = candidate
         if mrg_part is not None:

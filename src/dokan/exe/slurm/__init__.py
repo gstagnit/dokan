@@ -1,14 +1,26 @@
+import getpass
 import os
 import re
 import string
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
 from ..._types import GenericPath
 from ...db._loglevel import LogLevel
+from .._exe_data import ExeData
 from .._executor import Executor
+from .._queue import QueueSnapshot, QueueStatus
+
+# > Slurm states -> what dokan cares about (terminal states are not queued at all)
+_SLURM_STATUS: dict[str, QueueStatus] = {
+    "PENDING": QueueStatus.IDLE,
+    "CONFIGURING": QueueStatus.IDLE,
+    "RUNNING": QueueStatus.RUNNING,
+    "COMPLETING": QueueStatus.RUNNING,
+}
 
 
 class SlurmExec(Executor):
@@ -97,13 +109,93 @@ class SlurmExec(Executor):
             self.decrease_running_resources({"jobs_concurrent": n_completed})  # type: ignore[attr-defined]
             self.nactive = n_active
 
+    # ---------------------------------------------------------------------------
+    # > queue API (detached execution).  Untested against a live Slurm: it mirrors
+    # > the HTCondor implementation and the tracker's own `squeue` usage.
+    # ---------------------------------------------------------------------------
+
+    def is_submitted(self, exe_data: ExeData | None = None) -> bool:
+        settings: dict = (exe_data if exe_data is not None else self.exe_data).get("policy_settings", {})
+        return int(settings.get("slurm_id", 0) or 0) > 0
+
+    @classmethod
+    def queue_snapshot(cls, exe_datas: list[ExeData], log: Callable[[str, LogLevel], None]) -> QueueSnapshot:
+        """One `squeue` for every array task of ours: `(job id, task id, state, workdir)`."""
+        nretry: int = 3
+        retry_delay: float = 10.0
+        for exe_data in exe_datas:
+            settings: dict = exe_data.get("policy_settings", {})
+            nretry = max(nretry, int(settings.get("slurm_nretry", nretry) or nretry))
+            retry_delay = float(settings.get("slurm_retry_delay", retry_delay) or retry_delay)
+        cmd: list[str] = [
+            "squeue",
+            "--noheader",
+            "--array",
+            f"--user={getpass.getuser()}",
+            "--states=all",
+            "--format=%A|%K|%T|%Z",
+        ]
+        last: str = ""
+        for iretry in range(max(1, nretry)):
+            try:
+                squeue = subprocess.run(cmd, capture_output=True, text=True)
+            except OSError as exc:
+                raise RuntimeError(f"cannot run squeue: {exc}") from exc
+            if squeue.returncode == 0:
+                snapshot = QueueSnapshot()
+                for line in squeue.stdout.splitlines():
+                    fields = line.split("|")
+                    if len(fields) < 4:
+                        continue
+                    state: str = cls._normalize_state(fields[2])
+                    if not state or cls._is_terminal_state(state):
+                        continue
+                    try:
+                        job_id: int = int(fields[0])
+                        task_id: int = int(fields[1])
+                    except ValueError:
+                        continue  # > not an array task of ours
+                    snapshot.add(
+                        fields[3], task_id, _SLURM_STATUS.get(state, QueueStatus.OTHER), batch_id=job_id
+                    )
+                snapshot.queried.append("squeue")
+                return snapshot
+            last = f"{squeue.stdout}\n{squeue.stderr}"
+            log(f"SlurmExec: squeue failed (attempt {iretry + 1}/{nretry}):\n{last}", LogLevel.INFO)
+            time.sleep(retry_delay * 1.5**iretry)
+        raise RuntimeError(f"squeue failed after {nretry} attempt(s):\n{last}")
+
+    def seeds_in_queue(self, snapshot: QueueSnapshot) -> dict[int, QueueStatus] | None:
+        key: str | None = snapshot.lookup(self.exe_data.path)
+        if key is not None:
+            # > the template maps array task `i` to the i-th seed of the (contiguous) batch
+            seeds: list[int] = sorted(int(job["seed"]) for job in self.exe_data["jobs"].values())
+            return {
+                seeds[task]: status for task, status in snapshot.jobs[key].items() if 0 <= task < len(seeds)
+            }
+        return {} if self.is_submitted() else None
+
+    def adopt_submission(self, snapshot: QueueSnapshot) -> bool:
+        if self.is_submitted():
+            return False
+        key: str | None = snapshot.lookup(self.exe_data.path)
+        if key is None:
+            return False
+        self.exe_data["policy_settings"]["slurm_id"] = snapshot.batch_id[key]
+        self.exe_data.write()
+        self._logger(f"SlurmExec adopted job {snapshot.batch_id[key]} found in the queue", LogLevel.WARN)
+        return True
+
+    # ---------------------------------------------------------------------------
+
     def exe(self):
         # > recovery mode
         if (
             "slurm_id" in self.exe_data["policy_settings"]
             and self.exe_data["policy_settings"]["slurm_id"] > 0
         ):
-            self._track_job()
+            if not self.detached:
+                self._track_job()
             return
 
         # > populate the submission template file
@@ -154,6 +246,10 @@ class SlurmExec(Executor):
         if cluster_id < 0:
             self._logger(f"SlurmExec failed to submit job {self.exe_data.path}", LogLevel.WARN)
             return  # failed job
+
+        if self.detached:
+            self._logger(f"SlurmExec submitted job {cluster_id} [dim](detached)[/dim]", LogLevel.DEBUG)
+            return
 
         # > now we need to track the job
         self._track_job()

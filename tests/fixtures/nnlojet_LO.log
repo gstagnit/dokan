@@ -1,0 +1,210 @@
+ ******************************************************************************************************
+ *                                                                                                    *
+ *  NNLOJET: A multiprocess parton level event generator                                              *
+ *                                                                                                    *
+ ******************************************************************************************************
+ * Active bosons:                                                                                     *
+ *   W- boson                                                                                         *
+ *                                                                                                    *
+ *   > List of active processes <                                                                     *
+ *                                                                                                    *
+ *   id  partons                  Matrix Element                Subtraction                           *
+ *                                                                                                    *
+ *    1  d g to u lm nub          B1g0W(1,2,3,4,5)                                                    *
+ *                                                                                                    *
+ ******************************************************************************************************
+ *                                                                                                    *
+ *   > Input technical parameters <                                                                   *
+ *                                                                                                    *
+ * y0                                                          1.00000000000000003643E-10             *
+ * including angular rotations                                                                        *
+ * no phase space caching                                                                             *
+ *                                                                                                    *
+ *                                                                                                    *
+ *   > Input physics parameters <                                                                     *
+ *                                                                                                    *
+ * Z boson mass                                                9.11534806191827584598E+01             *
+ * Z boson width                                               2.49426637877282431077E+00             *
+ * W boson mass                                                8.03519715944906778304E+01             *
+ * W boson width                                               2.08429889367263898592E+00             *
+ * H boson mass                                                1.25180000000000006821E+02             *
+ * H boson width                                               4.02964385200000035220E-03             *
+ * sin^2(thw)                                                  2.22987289511059838532E-01             *
+ * 1/alpha                                                     1.32243874825381368510E+02             *
+ *                                                                                                    *
+ *   > Input kinematical parameters <                                                                 *
+ *                                                                                                    *
+ * Process: WMJUNSYM                                                                                  *
+ *     sqrt(s) = ******                                                                               *
+ *       > beam1 =         2212 [6500.0 GeV]                                                          *
+ *       > beam2 =         2212 [6500.0 GeV]                                                          *
+ *                                                                                                    *
+ *     Run: = WmC_ATLAS_2026                                                                          *
+ *     PDF1 = PDF4LHC21_mc [mem = 0]                                                                  *
+ *     MatchObs = OFF                                                                                 *
+ *                                                                                                    *
+ *   > Sweeps <                                                                                       *
+ *                                                                                                    *
+ *       production = 100[2]                                                                          *
+ * tag flavour:              4                                                                        *
+ *                                                                                                    *
+ *                                                                                                    *
+ *   > fastjet algorithms <                                                                           *
+ *                                                                                                    *
+ *   IFN [flavifn]:             R =   0.400, alpha =   2.000, omega =   1.000                         *
+ *   GHS [flavghs]:             R =   0.400, alpha =   2.000, ptcut =  20.000, omega =   1.000        *
+ *                                                                                                    *
+ *    > used observables <                                                                            *
+ *                                                                                                    *
+ *      1 : ptlm                                                                                 *
+ *      2 : abs_ylm                                                                              *
+ *      3 : njets                                                                                *
+ *      4 : IFN_flav_njets                                                                       *
+ *      5 : GHS_flav_njets                                                                       *
+ *      6 : etw                                                                                  *
+ *      7 : smin_over_shat                                                                       *
+ *      8 : IFN_flav_signj1                                                                      *
+ *      9 : IFN_flav_abs_yj1                                                                     *
+ *     10 : GHS_flav_signj1                                                                      *
+ *     11 : GHS_flav_abs_yj1                                                                     *
+ *                                                                                                    *
+ *   > Scales <                                                                                       *
+ *                                                                                                    *
+ *   ID                           muR                                     muF                         *
+ *   1                  1.000E+00 x etw                         1.000E+00 x etw                       *
+ *   2                  2.000E+00 x etw                         1.000E+00 x etw                       *
+ *   3                  5.000E-01 x etw                         1.000E+00 x etw                       *
+ *   4                  1.000E+00 x etw                         2.000E+00 x etw                       *
+ *   5                  2.000E+00 x etw                         2.000E+00 x etw                       *
+ *   6                  1.000E+00 x etw                         5.000E-01 x etw                       *
+ *   7                  5.000E-01 x etw                         5.000E-01 x etw                       *
+ *                                                                                                    *
+ *   > Selectors <                                                                                    *
+ *                                                                                                    *
+ * T1 accept:        1.00 <= GHS_flav_njets                                                           *
+ * T1 accept:        1.00 <= IFN_flav_njets                                                           *
+ * T0 accept:        1.00 <= njets                                                                    *
+ * T0 accept:                abs_ylm         <=         2.50                                          *
+ * T0 accept:       27.00 <= ptlm                                                                     *
+ *                                                                                                    *
+ *   > Jet settings <                                                                                 *
+ *                                                                                                    *
+ *   njets:            1 (inclusive)                                                                  *
+ *   jet algorithm:   anti-kt    R = 0.40                                                             *
+ *   naive flavour dressing                                                                           *
+ *                 flavour modulo 2 summation                                                         *
+ *   accept:       20.00 <= jets_pt                                                                   *
+ *   accept:                jets_abs_y      <=         2.50                                           *
+ *   accept:        0.40 <= jets_min_dr_lj                                                            *
+ *                                                                                                    *
+ *   > Histograms <                                                                                   *
+ *                                                                                                    *
+ * 0 abs_yj1_2j_GHS_osss     (GHS_flav_abs_yj in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 abs_yl_2j_GHS_osss      (abs_ylm         in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 ptl_2j_GHS_osss         (ptlm            in   36 bins)     [      27.000,      207.000]          *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 cross_2j_GHS_osss       (cross)                                                                  *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 abs_yj1_1j_GHS_osss     (GHS_flav_abs_yj in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 abs_yl_1j_GHS_osss      (abs_ylm         in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 ptl_1j_GHS_osss         (ptlm            in   36 bins)     [      27.000,      207.000]          *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 cross_1j_GHS_osss       (cross)                                                                  *                              
+ *                            x GHS_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   GHS_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 abs_yj1_2j_IFN_osss     (IFN_flav_abs_yj in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 abs_yl_2j_IFN_osss      (abs_ylm         in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 ptl_2j_IFN_osss         (ptlm            in   36 bins)     [      27.000,      207.000]          *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 cross_2j_IFN_osss       (cross)                                                                  *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          2.000 <=   njets             <=        2.000                      *
+ *                                                                                                    *
+ * 0 abs_yj1_1j_IFN_osss     (IFN_flav_abs_yj in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 abs_yl_1j_IFN_osss      (abs_ylm         in   10 bins)     [       0.000,        2.500]          *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 ptl_1j_IFN_osss         (ptlm            in   36 bins)     [      27.000,      207.000]          *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 cross_1j_IFN_osss       (cross)                                                                  *                              
+ *                            x IFN_flav_signj1                                                       *
+ * T          > accept[0]:          1.000 <=   IFN_flav_njets    <=        1.000                      *
+ * T          > accept[0]:          1.000 <=   njets             <=        1.000                      *
+ *                                                                                                    *
+ * 0 tcut_diff               (smin_over_shat  in   20 bins)     [       0.000,        1.000]          *                              
+ *                                                                                                    *
+ * 0 tcut_accum              (smin_over_shat  in   20 bins)     [       0.000,        1.000]          *                              
+ * cumulant =           -1
+ *                                                                                                    *
+ * 1 cross                   (cross)                                                                  *                              
+ *                                                                                                    *
+ *                                                                                                    *
+ ******************************************************************************************************
+ Repository id: 1.0.2
+
+Integrating using Basin algorithm, stage 2
+  Iterations: 2, events per iteration: 100
+  Integrator state file: WmJunsym.WmC_ATLAS_2026.y1.00E-10.LO.khs
+  Initializing seed to 1
+  Multichannel with 1 channels
+  Loading integrator state from file
+
+************ Integration by Basin (iteration 1 ) *******************
+*  integral  = 5.82162044e+04   accum. integral = 5.82162044e+04   *
+*  std. dev. = 1.08529408e+04   accum. std. dev = 1.08529408e+04   *
+************ chi**2/iteration = 0.00000000e+00  ********************
+
+************ Integration by Basin (iteration 2 ) *******************
+*  integral  = 3.85150754e+04   accum. integral = 4.36411990e+04   *
+*  std. dev. = 6.43631970e+03   accum. std. dev = 5.53600423e+03   *
+************ chi**2/iteration = 2.43783873e+00  ********************
+
+ Elapsed time =    1.41725     seconds 
