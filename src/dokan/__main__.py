@@ -31,7 +31,7 @@ from sqlalchemy import func, select
 
 from .__about__ import __version__
 from .bib import make_bib
-from .config import Config
+from .config import Config, check_opt_target
 from .db._dbdoctor import DBDoctor
 from .db._dbinit import DBInit
 from .db._dbmerge import MergeFinal
@@ -520,6 +520,10 @@ def main() -> None:
             config["exe"]["path"] = args.exe
         if args.log_level is not None:
             config["ui"]["log_level"] = args.log_level
+        try:
+            check_opt_target(config)
+        except ValueError as exc:
+            sys.exit(f"invalid optimisation target: {exc}")
         if config["exe"]["policy"] == ExecutionPolicy.LOCAL:
             sys.exit("tick mode needs a batch system (policy is local); use `submit`")
         n_cap_cfg = config["run"]["jobs_max_total"]
@@ -1043,6 +1047,10 @@ def main() -> None:
     if args.action in ["submit", "doctor", "finalize"]:
         config = _load_config(args.run_path)
         channels = config["process"].pop("channels")
+        try:
+            check_opt_target(config)
+        except ValueError as exc:
+            sys.exit(f"invalid optimisation target: {exc}")
 
         # > CLI overrides: persistent overwrite --> config
         if nnlojet_exe is not None:

@@ -250,6 +250,32 @@ it is a geometric mean, so histograms that are relatively better determined pull
 it down. That is the existing design of the target, not a side effect of this
 guard.
 
+### Optimising on one distribution
+
+`run.opt_observables` (a list of names from `run.histograms`, empty by default)
+restricts the maximum above to the named observables, so a run whose goal is one
+distribution is not steered by the others.  `run.opt_bins` judges every selected
+observable by its worst *significant bin* instead of its integral -- an integral
+can be determined to a percent while individual bins are not, and the bins are
+what such a run is after.  The overflow bin is left out of that maximum: it is
+rarely what one wants and often the worst-determined bin.  Both settings are
+read from `config.json` (every tick re-reads it) and validated at `submit` /
+`tick` start; cumulant observables cannot be selected, and the selection has no
+effect with `opt_target = cross`.
+
+A run that wants one distribution to a given accuracy would therefore set
+
+```json
+"opt_target": "hist",
+"opt_observables": ["ptl_1j_IFN_osss"],
+"opt_bins": true
+```
+
+and read the reported accuracy as that distribution's worst significant bin.
+The significance filter still applies per bin: a bin consistent with zero says
+nothing about how well the part is determined and is skipped, and a part with
+no significant bin at all falls back to its cross-section error, as before.
+
 ### Units
 
 CPU budgets are reported in hours, or kilo-hours once large (`format_cpu_time`),

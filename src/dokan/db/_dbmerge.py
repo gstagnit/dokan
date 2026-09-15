@@ -12,6 +12,7 @@ import re
 import shutil
 import time
 from abc import ABCMeta
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -60,6 +61,106 @@ from ._sqla import Job, Log, Part
 # > Deliberately narrow: a `ValueError` out of `build_obs_group()` (a binning
 # > mismatch against the runcard, say) is a genuine inconsistency and stays fatal.
 _HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
+
+# > An observable (or a bin of one) must be a *measurement* before its relative error
+# > may steer the optimisation: `|value| > _HIST_SIGNIFICANCE * error`.  A differential
+# > distribution with large bin-to-bin cancellations can integrate to something
+# > consistent with zero while keeping a perfectly finite error, and its relative error
+# > is then meaningless and unboundedly large: one observed case had an integral of
+# > -0.13 +/- 947.7, giving |e/r| = 7160, which set the maximum for its part and through
+# > it the part's whole optimisation error (70,415 against a cross section of
+# > -947.7 +/- 730.8).  Guarding only on `r != 0.0` catches exact zeros and misses
+# > precisely this.  The consequences were not cosmetic: `_distribute_time` allocates
+# > by `Part.error`, so such a part soaks up the entire budget chasing a relative error
+# > that cannot improve -- the denominator is zero by cancellation, not by lack of
+# > statistics -- and the run's reported accuracy and `T_target` are nonsense (39.3%
+# > and 11200 kh, against a cross section determined to 1.1%).
+_HIST_SIGNIFICANCE: float = 2.0
+
+
+@dataclass(frozen=True)
+class ObsFigure:
+    """One observable's contribution to a part's optimisation error.
+
+    `result` / `error` are the integral over the distribution (the bare number for
+    a total cross section); `bins` are the in-range bins' `(value, error)` for a
+    differential distribution, empty otherwise.  The overflow is part of the
+    integral but not of `bins`: it is rarely what a run is after, and it is often
+    the worst-determined bin, which would let it steer the whole part.
+    """
+
+    name: str
+    result: float
+    error: float
+    bins: tuple[tuple[float, float], ...] = ()
+
+    @staticmethod
+    def _rel(value: float, error: float) -> float | None:
+        """Relative error of a measurement; None when it is not one."""
+        if value == 0.0 or abs(value) <= _HIST_SIGNIFICANCE * error:
+            return None
+        return abs(error / value)
+
+    def rel_error(self, *, per_bin: bool = False) -> float | None:
+        """The worst relative error this observable asks the optimiser to bring down.
+
+        By integral, or (`per_bin`) by its worst significant bin -- falling back
+        to the integral for an observable without differential bins.  None when
+        nothing about it is a measurement yet.
+        """
+        if per_bin and self.bins:
+            rels = [rel for value, error in self.bins if (rel := self._rel(value, error)) is not None]
+            if rels:
+                return max(rels)
+        return self._rel(self.result, self.error)
+
+
+def optimisation_error(
+    figures: list[ObsFigure],
+    rel_cross_err: float,
+    opt_target: str,
+    *,
+    opt_observables=(),
+    opt_bins: bool = False,
+) -> tuple[float, float]:
+    """`(relative error to optimise on, worst histogram relative error)` of one part.
+
+    The histogram figure is the worst relative error over the observables -- all of
+    them, or only those in `opt_observables` -- each judged by its integral or, with
+    `opt_bins`, by its worst significant bin.  Nothing significant among them: the
+    histograms say nothing yet about how well this part is determined, so the part
+    is optimised on its cross section alone rather than on an invented number.  (An
+    earlier version appended a synthetic `(1.0, 1e-9)` entry to keep the maximum
+    non-empty; with the significance filter that would make such a part look
+    perfectly determined.)
+
+    `opt_target` then combines the two: `cross` ignores the histograms, `hist` uses
+    them alone, `cross_hist` takes the geometric mean -- the histogram figure is a
+    worst case, so a plain mean would over-weight it.
+    """
+    selected: set[str] = set(opt_observables or ())
+    candidates = [fig for fig in figures if not selected or fig.name in selected]
+    rels: list[float] = [rel for fig in candidates if (rel := fig.rel_error(per_bin=opt_bins)) is not None]
+    max_rel_hist_err: float = max(rels) if rels else rel_cross_err
+    if opt_target == "cross":
+        return rel_cross_err, max_rel_hist_err
+    if opt_target == "cross_hist":
+        return math.sqrt(rel_cross_err * max_rel_hist_err), max_rel_hist_err
+    if opt_target == "hist":
+        return max_rel_hist_err, max_rel_hist_err
+    raise ValueError(f"unknown opt_target {opt_target!r}")
+
+
+def opt_target_label(config: dict) -> str:
+    """The target as reported next to the accuracy: `hist[ptl_1j]`, `cross_hist`, ..."""
+    run: dict = config["run"]
+    label: str = str(run["opt_target"])
+    if label != "cross" and (selected := run.get("opt_observables")):
+        label += "[" + ",".join(selected) + ("; bins" if run.get("opt_bins") else "") + "]"
+    elif label != "cross" and run.get("opt_bins"):
+        label += "[bins]"
+    return label
+
 
 # > How often `MergePart` may re-yield an unchanged pending set before giving up.  Each
 # > crash mid-merge costs one attempt, so this must exceed 1 for a run to survive being
@@ -249,16 +350,22 @@ class MergePart(DBMerge):
 
         Silent when there is nothing to say, which is the common case.
         """
-        agg = {"bins": 0, "bins_flagged": 0, "slots": 0, "n_cand": 0,
-               "n_trimmed": 0, "cap_hit": 0, "bins_no_plateau": 0}
+        agg = {
+            "bins": 0,
+            "bins_flagged": 0,
+            "slots": 0,
+            "n_cand": 0,
+            "n_trimmed": 0,
+            "cap_hit": 0,
+            "bins_no_plateau": 0,
+        }
         for obs, task in mrg_obs_dict.items():
             record = getattr(task, "file_record", None)
             meta = read_json_sidecar(record) if record is not None else None
             diag = meta.get("diag") if isinstance(meta, dict) else None
             if not isinstance(diag, dict):
                 continue
-            for key in ("bins", "bins_flagged", "slots", "n_cand", "n_trimmed",
-                        "cap_hit", "bins_no_plateau"):
+            for key in ("bins", "bins_flagged", "slots", "n_cand", "n_trimmed", "cap_hit", "bins_no_plateau"):
                 agg[key] += int(diag.get(key) or 0)
 
         if not (agg["bins_flagged"] or agg["n_trimmed"] or agg["bins_no_plateau"]):
@@ -647,9 +754,7 @@ class MergePart(DBMerge):
                         )
                     ]
                 )
-            write_json_sidecar(
-                guard_file, {"pending_identity": pending_identity, "attempt": attempt}
-            )
+            write_json_sidecar(guard_file, {"pending_identity": pending_identity, "attempt": attempt})
             yield list(pending_obs.values())
         # > merge converged for the current inputs: retire the guard fingerprint
         guard_file.unlink(missing_ok=True)
@@ -659,7 +764,7 @@ class MergePart(DBMerge):
         # > update cross section estimates for the part & collect all estimates also from distributions
         cross_result: float = 0.0
         cross_error: float = 0.0
-        cross_list: list[tuple[float, float]] = []
+        figures: list[ObsFigure] = []
         # > update needs to loop over all histograms, not just the ones that were updated
         for obs in self.config["run"]["histograms"]:
             # print(f" post-processing observable {obs} ...")
@@ -674,6 +779,7 @@ class MergePart(DBMerge):
                 continue  # @todo ?
 
             res, err = 0.0, 0.0  # accumulate bins to "cross" (possible fac, selectors, ...)
+            bins: list[tuple[float, float]] = []  # (value, error) per in-range bin
             if nx == 0:
                 with open(file_out) as cross:
                     for line in cross:
@@ -697,6 +803,7 @@ class MergePart(DBMerge):
                         # > this is formally not the correct way to compute the error
                         # > but serves as a conservative error for optimizing on histograms
                         err += ((col[2] - col[0]) * col[4]) ** 2
+                        bins.append((col[3], col[4]))
             else:
                 raise ValueError(self._logger_prefix + f"::run:  unexpected nx = {nx}")
             err = math.sqrt(err)
@@ -705,7 +812,7 @@ class MergePart(DBMerge):
                 cross_result = res
                 cross_error = err
 
-            cross_list.append((res, err))
+            figures.append(ObsFigure(obs, res, err, tuple(bins)))
 
         # > update the error from the chosen optimization target
         opt_target: str = self.config["run"]["opt_target"]
@@ -739,42 +846,16 @@ class MergePart(DBMerge):
                 )
             rel_cross_err = min_rel_err
 
-        # > Worst relative error over the observables -- but only over those that are
-        # > actually a *measurement*.  Each entry is an observable's integral, and a
-        # > differential distribution with large bin-to-bin cancellations can integrate
-        # > to something consistent with zero while keeping a perfectly finite error.
-        # > Its relative error is then meaningless and unboundedly large: one observed
-        # > case had an integral of -0.13 +/- 947.7, giving |e/r| = 7160, which set this
-        # > maximum and through it the part's whole optimisation error (70,415 against a
-        # > cross section of -947.7 +/- 730.8).  Guarding only on `r != 0.0` catches
-        # > exact zeros and misses precisely this.
-        # >
-        # > The consequences were not cosmetic: `_distribute_jobs` allocates by
-        # > `Part.error`, so such a part soaks up the entire budget chasing a relative
-        # > error that cannot improve -- the denominator is zero by cancellation, not by
-        # > lack of statistics -- and the run's reported accuracy and `T_target` are
-        # > nonsense (39.3% and 11200 kh, against a cross section determined to 1.1%).
-        _HIST_SIGNIFICANCE: float = 2.0
-        significant: list[tuple[float, float]] = [
-            (r, e) for r, e in cross_list if r != 0.0 and abs(r) > _HIST_SIGNIFICANCE * e
-        ]
-        # > Nothing significant: the histograms say nothing about how well this part is
-        # > determined, so optimise on the cross section alone rather than inventing a
-        # > number.  (The old code appended a synthetic `(1.0, 1e-9)` entry to keep the
-        # > max non-empty; that would now make such a part look perfectly determined.)
-        max_rel_hist_err: float = (
-            max(abs(e / r) for r, e in significant) if significant else rel_cross_err
+        from ..config import check_opt_target  # > local: `config` imports this package
+
+        check_opt_target(self.config)
+        rel_cross_err, max_rel_hist_err = optimisation_error(
+            figures,
+            rel_cross_err,
+            opt_target,
+            opt_observables=self.config["run"].get("opt_observables") or (),
+            opt_bins=bool(self.config["run"].get("opt_bins", False)),
         )
-        if opt_target == "cross":
-            pass  # keep cross error for optimisation
-        elif opt_target == "cross_hist":
-            # rel_cross_err = (rel_cross_err+max_rel_hist_err)/2.0
-            # > since we took the worst case for max_rel_hist_err, let's take a geometric mean
-            rel_cross_err = math.sqrt(rel_cross_err * max_rel_hist_err)
-        elif opt_target == "hist":
-            rel_cross_err = max_rel_hist_err
-        else:
-            raise ValueError(self._logger_prefix + f"::run:  unknown opt_target {opt_target}")
         final_error: float = abs(rel_cross_err * cross_result)
 
         # > mark part merging as complete in the DB.  HDF5 observable timestamps
@@ -943,7 +1024,7 @@ class MergeAll(DBMerge):
             # > use `distribute_time` to fetch the optimization target (includes the
             # > error-penalty adjustments a plain sum over parts would miss)
             # > use small 1s value; a non-zero time to avoid division by zero
-            opt_target: str = self.config["run"]["opt_target"]
+            opt_target: str = opt_target_label(self.config)
             opt_dist = self._distribute_time(session, 1.0)
             opt_target_rel: float = (
                 abs(opt_dist["tot_error"] / opt_dist["tot_result"]) if opt_dist["tot_result"] != 0.0 else 0.0
@@ -1243,7 +1324,7 @@ class MergeFinal(DBMerge):
             prev_T_target: float = 1.0
             opt_dist = self._distribute_time(session, prev_T_target)
             # self._logger(session,f"{opt_dist}")
-            opt_target: str = self.config["run"]["opt_target"]
+            opt_target: str = opt_target_label(self.config)
             self._logger(
                 session,
                 f'option "[bold]{opt_target}[/bold]" chosen to target optimization of rel. acc.',

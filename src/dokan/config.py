@@ -59,6 +59,12 @@ _schema: dict = {
         "histograms_single_file": str,  # name in case we concatenate all histograms to a single file
         "order": Order,  # what order to compute (LO, NLO, NNLO)
         "opt_target": str,  # the target we wish to optimise: ["cross"|"cross_hist"|"hist"]
+        # > which observables the `hist` part of the target looks at (empty: all of
+        # > them); names from `run.histograms`, cumulants excluded
+        "opt_observables": [str],
+        # > judge each selected observable by its worst significant *bin* instead of
+        # > its integral -- for a run whose goal is one distribution, not its total
+        "opt_bins": bool,
         "target_rel_acc": float,  # target relative accuracy
         "job_max_runtime": float,  # integration-time budget (in sec) for a single NNLOJET run
         # > extra wall clock requested from the batch system on top of `job_max_runtime`,
@@ -153,6 +159,36 @@ _transient: list[tuple[str, str]] = [
     ("warmup", "skip_qc"),  # `submit --no-warmup`
     ("run", "detached"),  # `tick`
 ]
+
+_OPT_TARGETS: tuple[str, ...] = ("cross", "cross_hist", "hist")
+
+
+def check_opt_target(config) -> None:
+    """Reject an optimisation target that names unknown or unusable observables.
+
+    Raised early (at `submit` / `tick` start) rather than at the first merge, where
+    the failure would surface hours later in the log database.
+    """
+    run: dict = config["run"]
+    target: str = run["opt_target"]
+    if target not in _OPT_TARGETS:
+        raise ValueError(f"run.opt_target = {target!r}: expected one of {', '.join(_OPT_TARGETS)}")
+    selected: list[str] = list(run.get("opt_observables") or [])
+    if not selected:
+        return
+    histograms: dict = run.get("histograms") or {}
+    unknown: list[str] = [obs for obs in selected if obs not in histograms]
+    if unknown:
+        raise ValueError(
+            f"run.opt_observables names observables that are not in the runcard: {unknown}"
+            f" (known: {sorted(histograms)})"
+        )
+    cumulants: list[str] = [obs for obs in selected if "cumulant" in histograms[obs]]
+    if cumulants:
+        raise ValueError(f"run.opt_observables: cumulant observables cannot be optimised on: {cumulants}")
+    if target == "cross":
+        warnings.warn("run.opt_observables has no effect with run.opt_target = 'cross'", stacklevel=2)
+
 
 # > sentinel to tell "key absent" apart from "key present with a falsy value"
 # > (e.g. `frozen: false`) when pruning: presence must decide the warning, not truthiness

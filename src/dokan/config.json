@@ -7,6 +7,8 @@
     "order": 2,
     "histograms": {},
     "opt_target": "cross_hist",
+    "opt_observables": [],
+    "opt_bins": false,
     "target_rel_acc": 0.01,
     "job_max_runtime": 4200,
     "job_max_runtime_margin": 0.15,
