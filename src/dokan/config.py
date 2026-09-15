@@ -13,6 +13,7 @@ _schema : dict
 
 import copy
 import json
+import re
 import warnings
 from collections import UserDict
 from pathlib import Path
@@ -147,6 +148,131 @@ _schema: dict = {
     },
 }
 
+# > one line per option, written above it in the run's `config.json` (as `// ...`
+# > comment lines, which `read_config_json` strips) so the file explains itself
+_DOC: dict[str, dict[str, str]] = {
+    "exe": {
+        "path": "absolute path to the NNLOJET executable",
+        "policy": "where jobs run: local, htcondor or slurm",
+        "policy_settings": (
+            "backend settings: <backend>_template (submit template in this folder), _ncores,"
+            " _nretry, _retry_delay and _poll_time (seconds)"
+        ),
+    },
+    "run": {
+        "dokan_version": "dokan version that created this run",
+        "name": "run name, taken from the runcard",
+        "path": "this run directory (absolute)",
+        "raw_path": "optional separate location for the raw job output",
+        "template": "runcard template in this folder; do not edit it by hand (its checksum is verified)",
+        "md5": "checksum of the template, to detect manual edits",
+        "histograms": "observables of the runcard with their binning (auto-filled)",
+        "histograms_single_file": "NNLOJET writes all observables of a job into one file of this name",
+        "order": "perturbative order: 0 = LO, 1 = NLO, 2 = NNLO (negative: that order's contribution only)",
+        "opt_target": (
+            'accuracy the run optimises and reports: "cross", "hist" (worst observable)'
+            ' or "cross_hist" (geometric mean of the two)'
+        ),
+        "opt_observables": 'observables the "hist" part looks at (empty: all; cumulants excluded)',
+        "opt_bins": "judge each selected observable by its worst significant bin instead of its integral",
+        "target_rel_acc": "relative accuracy at which dispatch stops, e.g. 0.01 = 1%",
+        "job_max_runtime": "integration-time budget of one job, in seconds; jobs are sized to fill it",
+        "job_max_runtime_margin": (
+            "extra wall time requested from the batch system on top of job_max_runtime, as a fraction"
+        ),
+        "job_runtime_safety_factor": (
+            "multiplier on a job's predicted runtime for its wall-time request (0: always request the cap)"
+        ),
+        "job_fill_max_runtime": "size every production job to use the whole runtime budget",
+        "jobs_max_total": "maximum number of production jobs per submission (0: unlimited)",
+        "jobs_max_total_runtime": (
+            "runtime budget of the whole campaign in seconds, warmup included"
+            " (0: jobs_max_total x job_max_runtime)"
+        ),
+        "finalize_interval": (
+            "seconds between refreshes of result/final while production runs (0: only at the end)"
+        ),
+        "jobs_max_concurrent": "maximum number of jobs in the batch queue at once",
+        "jobs_batch_size": (
+            "seeds of one part submitted as one batch-system cluster"
+            " (derived at submit/tick unless overridden there)"
+        ),
+        "jobs_batch_unit_size": "smallest batch a dispatch wave may submit",
+        "seed_offset": "seeds are numbered from seed_offset + 1",
+        "timestamps": "unused",
+    },
+    "ui": {
+        "monitor": "show the live status board during submit",
+        "refresh_delay": "board refresh interval in seconds",
+        "log_level": "messages below this level are dropped: 10 debug, 20 info, 30 warn, 40 error",
+    },
+    "process": {
+        "name": "NNLOJET process name",
+        "channels": (
+            "the parts of the calculation: label -> NNLOJET channel string, part, part_num, order"
+            " (and region); split or regroup channels here before the first submit"
+        ),
+    },
+    "warmup": {
+        "ncores": "cores per warmup job",
+        "ncall_start": "events per iteration of the first warmup step",
+        "niter": "iterations per warmup job (at least 2)",
+        "min_increment_steps": "warmup steps before the quality checks may end the warmup (at least 2)",
+        "max_increment_steps": "warmup steps after which the warmup ends regardless",
+        "fac_increment": "statistics growth factor from one warmup step to the next",
+        "max_chi2dof": "largest chi2/dof accepted from the last warmup step",
+        "max_err_rel_var": "largest relative spread of the per-iteration errors accepted",
+        "scaling_window": "tolerance on the 1/sqrt(N) error scaling between the last two steps",
+    },
+    "production": {
+        "ncores": "cores per production job",
+        "ncall_start": "events per iteration of the pre-production job, and the floor for all production jobs",
+        "niter": "iterations per production job",
+        "penalty_wrt_warmup": "expected slowdown of production w.r.t. warmup, used to size the pre-production",
+        "fac_merge_trigger": "re-merge a part once (#done + #merged + 1) / (#merged + 1) exceeds this (> 1)",
+        "min_number": "production jobs a part needs before its error is trusted by the optimiser",
+    },
+    "merge": {
+        "trim_threshold": "robust-z score above which a dataset is flagged as an outlier (0: off)",
+        "trim_max_fraction": "at most this fraction of the datasets of a bin may be removed (0: flag only)",
+        "k_scan_nsteps": "steps of the k-scan used to find the error plateau",
+        "k_scan_maxdev_steps": "maximum deviation between k-scan steps still counted as a plateau",
+    },
+}
+
+_COMMENT_HEADER: str = "// dokan run configuration: lines starting with // are comments and are ignored"
+
+
+def read_config_json(path: GenericPath) -> dict:
+    """Read a `config.json`, ignoring full-line `//` comments (see `Config.write`)."""
+    with open(path) as fin:
+        lines = [line for line in fin if not line.lstrip().startswith("//")]
+    return json.loads("".join(lines))
+
+
+def annotate_config_json(text: str) -> str:
+    """Insert the `_DOC` comment above every documented option of a serialised config.
+
+    Relies on `json.dumps(indent=2)`: sections sit at two spaces, options at four.
+    Anything nested deeper (histograms, channels) is left alone.
+    """
+    out: list[str] = [_COMMENT_HEADER]
+    section: str | None = None
+    first: bool = True
+    for line in text.splitlines():
+        if match := re.match(r'^  "([^"]+)": ', line):
+            section = match.group(1)
+            first = True
+        elif (match := re.match(r'^    "([^"]+)": ', line)) and section in _DOC:
+            if doc := _DOC[section].get(match.group(1)):
+                if not first:
+                    out.append("")
+                out.append(f"    // {doc}")
+            first = False
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 # > keys dropped from the schema but possibly persisted by older versions:
 # > pruned on load so validation keeps rejecting genuinely unknown keys
 _deprecated: list[tuple[str, str]] = [
@@ -268,15 +394,13 @@ class Config(UserDict):
         self["run"]["path"] = str(self.path.absolute())
 
     def load_defaults(self) -> None:
-        with open(_default_config) as tmp:
-            self.data = json.load(tmp)
+        self.data = read_config_json(_default_config)
         if not self.is_valid(convert_to_type=True):
             raise RuntimeError("Config: load_defaults encountered conflict with schema")
 
     def load(self, default_ok: bool = True) -> None:
         if self.file_cfg and self.file_cfg.exists():
-            with open(self.file_cfg) as fin:
-                self.data = json.load(fin)
+            self.data = read_config_json(self.file_cfg)
             for section, key in _deprecated:
                 if self.data.get(section, {}).pop(key, _MISSING) is not _MISSING:
                     warnings.warn(f"Config: dropped deprecated setting {section}.{key}", stacklevel=2)
@@ -301,9 +425,7 @@ class Config(UserDict):
                 raise RuntimeError("Template has been manually modified, this is not allowed.")
 
     def fill_defaults(self):
-        with open(_default_config) as tmp:
-            defaults = json.load(tmp)
-            fill_missing(self.data, defaults)
+        fill_missing(self.data, read_config_json(_default_config))
 
     def write(self) -> None:
         if not self.path or not self.file_cfg:
@@ -311,5 +433,7 @@ class Config(UserDict):
         data: dict = copy.deepcopy(self.data)
         for section, key in _transient:
             data.get(section, {}).pop(key, None)
+        # > every option carries its one-line explanation as a `//` comment above it;
+        # > `read_config_json` strips them, other readers must do the same
         with open(self.file_cfg, "w") as cfg:
-            json.dump(data, cfg, indent=2)
+            cfg.write(annotate_config_json(json.dumps(data, indent=2)))

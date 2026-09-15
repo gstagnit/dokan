@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from dokan.config import read_config_json
+
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 FAKECONDOR = HERE / "fakecondor"
@@ -149,7 +151,7 @@ class Run:
         return _plain(proc.stdout)
 
     def config(self, **updates) -> None:
-        config = json.loads((self.path / "config.json").read_text())
+        config = read_config_json(self.path / "config.json")
         for dotted, value in updates.items():
             section, key = dotted.split(".")
             config[section][key] = value
@@ -389,6 +391,6 @@ def test_14_queue_failure_aborts_before_touching_anything(run: Run):
 
 
 def test_15_config_detached_is_never_persisted(run: Run):
-    config = json.loads((run.path / "config.json").read_text())
+    config = read_config_json(run.path / "config.json")
     assert "detached" not in config["run"]
     assert re.search(r'"jobs_batch_size"', (run.path / "config.json").read_text()) is None
