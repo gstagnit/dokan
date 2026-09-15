@@ -142,18 +142,50 @@ are discarded, not down-weighted.
 `MergePart` reports per part whenever the detector finds anything:
 
 ```
-MergePart[<part>]::run:  outliers flagged in 3 bin(s), up to 5 per bin,
-    worst carrying 97% of the integral (cross); 4 discarded;
-    no k-scan plateau in 1 bin(s): more seeds needed
+MergePart[<part>]::run:  outliers in 1845/2044 bins (90%); 4% of dataset-slots
+    removed (32295/860524); worst holds 62% of a determined bin (ptl_1j_IFN_osss);
+    cap reached in 31/2044 bins (2%); no k-scan plateau in 239/2044 bins (12%)
 ```
 
-* **`carrying X% of the integral`** — how much of the bin the flagged datasets
-  hold. Large values are expected for genuine artifacts, so this is context, not
-  an alarm.
-* **`no k-scan plateau`** — the ladder ran to the fully pooled estimate without
-  its ends agreeing. Paired with a large relative error it means the seed sample
-  cannot resolve the tail: add seeds. On its own it is not necessarily trouble; a
-  part can reach the pooled end and still be precise.
+Every figure carries its denominator. Without one these read as a catastrophe and
+are not: a double-real channel flags something in nearly every bin while removing
+a few percent of the data.
+
+* **`X% of dataset-slots removed`** is the number that matters — 3-4% on real
+  campaigns.
+* **`cap reached in N/M bins`** is the one genuine warning: a bin held more
+  outliers than `trim_max_fraction` allows removing, so the loop stopped on the
+  valve rather than the threshold and contamination remains.
+* **`no k-scan plateau`** paired with a large relative error means the seed sample
+  cannot resolve the tail. Alone it is not necessarily trouble.
+* **`worst holds X% of a determined bin`** is reported only where the bin is at
+  least a 2-sigma measurement. The denominator is a sum with cancellations, so a
+  bin consistent with zero sends the ratio to absurd values — 310,000% was
+  observed before this guard — that say nothing about the data.
+
+## Checking that the parameters are right
+
+The test is insensitivity: vary `trim_threshold` over an order of magnitude and
+confirm the answer moves by less than its error. Measured on two campaigns, with
+`trim_max_fraction = 0.05`:
+
+| `trim_threshold` | campaign A (fb) | campaign B (fb) |
+|---|---|---|
+| none | 201,817 +/- 27,128 | 179,301 +/- 8,029 |
+| 8 | 182,332 +/- 2,474 | 179,262 +/- 2,080 |
+| 15 | 186,418 +/- 2,380 | 179,197 +/- 2,373 |
+| 30 | 185,198 +/- 3,320 | 181,525 +/- 3,032 |
+| 100 | 187,290 +/- 3,596 | 177,786 +/- 2,177 |
+
+Every trimmed row agrees within its error; only "no trimming" stands apart, and
+its error is an order of magnitude larger. The k-scan is equally stable —
+`k_scan_nsteps` 2 to 5 and `k_scan_maxdev_steps` 0.2 to 0.8 span 179,468 to
+184,964 fb against errors of 1,600-3,300.
+
+Note that the robust-z distribution is a **continuum**, not two separated
+populations — a representative bin runs 109, 35, 19, 17, 16, 15, 15, 14, 12, 11,
+10, 10, 9.8, 9.1, 8.1, 7.9, ... so there is no gap to put the threshold in. That
+is precisely why the insensitivity check matters more than the choice of 8.
 
 If a channel is flagged persistently and heavily, the artifacts are worth chasing
 at the source rather than only removing here: the events are reproducible (the

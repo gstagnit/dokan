@@ -941,8 +941,8 @@ class MergeObs(Task):
             # > spurious outlier contributes almost nothing to it; one that carries the
             # > integral is the physics, and removing it would not clean the sample but
             # > change the answer.
-            diag = {"bins": 0, "bins_flagged": 0, "n_flagged": 0, "max_share": 0.0,
-                    "n_trimmed": 0, "bins_no_plateau": 0}
+            diag = {"bins": 0, "bins_flagged": 0, "slots": 0, "n_cand": 0, "n_trimmed": 0,
+                    "cap_hit": 0, "max_share": 0.0, "bins_no_plateau": 0}
 
             for irow in range(nrows):
                 for icol in range(ncols):
@@ -1013,13 +1013,24 @@ class MergeObs(Task):
                             # > and independently of whether removal is enabled at all
                             _cand = _mask & (bin_buf1 > trim_threshold)
                             _n_cand = int(np.sum(_cand))
+                            diag["slots"] += n_active
+                            diag["n_cand"] += _n_cand
                             if _n_cand > 0:
                                 diag["bins_flagged"] += 1
-                                diag["n_flagged"] = max(diag["n_flagged"], _n_cand)
+                                # > Share of the bin's integral held by the flagged datasets.  Only
+                                # > meaningful where the bin is actually determined: the denominator
+                                # > is a sum with cancellations, so a bin consistent with zero sends
+                                # > this to absurd values (hundreds of thousands of percent) that say
+                                # > nothing about the data.  Require the bin to be at least a 2-sigma
+                                # > measurement before believing the ratio.
                                 _tot_f = float(np.sum(bin_cmlt["sumf"][_mask]))
-                                if _tot_f != 0.0:
-                                    _share = abs(float(np.sum(bin_cmlt["sumf"][_cand])) / _tot_f)
-                                    diag["max_share"] = max(diag["max_share"], _share)
+                                _tot_n = float(np.sum(bin_cmlt["neval"][_mask]))
+                                if _tot_n > 0.0 and _tot_f != 0.0:
+                                    _ssd = float(np.sum(bin_cmlt["sumf2"][_mask])) - _tot_f**2 / _tot_n
+                                    _sig = float(np.sqrt(_ssd)) if _ssd > 0.0 else 0.0
+                                    if _sig > 0.0 and abs(_tot_f) > 2.0 * _sig:
+                                        _share = abs(float(np.sum(bin_cmlt["sumf"][_cand])) / _tot_f)
+                                        diag["max_share"] = max(diag["max_share"], _share)
 
                             # > Trim the most significant offsets first, stopping once we drop below
                             # > the threshold or reach the safety valve.  The valve is
@@ -1030,6 +1041,12 @@ class MergeObs(Task):
                             max_trim = max(1.0, trim_max_fraction * ndat) if trim_max_fraction > 0.0 else 0.0
                             for ntrim, itrim in enumerate(np.argsort(-bin_buf1)):  # most significant first
                                 if bin_buf1[itrim] <= trim_threshold or (ntrim + 1) > max_trim:
+                                    # > the valve, not the threshold, ended the loop: there were more
+                                    # > outliers than we are willing to remove.  That is the state
+                                    # > worth reporting -- it means the sample is not "bulk plus a
+                                    # > sparse tail" and the trim is leaving contamination behind.
+                                    if bin_buf1[itrim] > trim_threshold:
+                                        diag["cap_hit"] += 1
                                     break
                                 bin_mask[itrim] = BinMask.TRIMMED
                             # > Trimmed datasets are pooled into the trailing slot, which is then
@@ -1038,7 +1055,7 @@ class MergeObs(Task):
                             # > k-scan below is the bias control, and it can only see a bias in data
                             # > it still has.
                             _mask = bin_mask == BinMask.TRIMMED
-                            diag["n_trimmed"] = max(diag["n_trimmed"], int(np.sum(_mask)))
+                            diag["n_trimmed"] += int(np.sum(_mask))
                             bin_cmlt["neval"][ndat] = np.sum(bin_cmlt["neval"][_mask])
                             bin_cmlt["sumf"][ndat] = np.sum(bin_cmlt["sumf"][_mask])
                             bin_cmlt["sumf2"][ndat] = np.sum(bin_cmlt["sumf2"][_mask])

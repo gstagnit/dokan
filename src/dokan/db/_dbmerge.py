@@ -225,34 +225,42 @@ class MergePart(DBMerge):
     def _log_outlier_diagnostics(self, session, mrg_obs_dict: dict) -> None:
         """Surface what the outlier detector saw, aggregated over the part's observables.
 
-        Removal is disabled by default, so these numbers are a diagnosis rather than a
-        record of surgery.  Two of them are worth acting on:
+        Every figure carries its denominator, because none of them means anything
+        without one. A heavy-tailed part flags something in nearly every bin while
+        removing only a few percent of the data, so a bare bin count reads as a
+        catastrophe and is not one.
 
-        * `no plateau in N bin(s)` -- the k-scan walked its whole bias/variance ladder
-          without the inverse-variance and pooled ends ever agreeing.  Together with a
-          large relative error that means the seed sample is too small to resolve the
-          tail, and the answer is more seeds.  It is the only reliable signal here.
-        * `carrying X% of the integral` -- how much of the bin's integral the flagged
-          datasets hold.  Near zero they are noise; of order one they *are* the result,
-          and no amount of cleverness in the merge can tell which from the data alone
-          (removing such a dataset shifts the mean by about the same amount as it
-          inflates the error, so the shift is never significant -- see
-          doc/outlier_trimming.md).
+        * `outliers in N/M bins` -- how widespread the flagging is. High is normal for
+          double-real channels and is not by itself a problem.
+        * `X% of dataset-slots removed` -- the number that actually matters. Measured
+          around 3-4% on real campaigns. The result should be insensitive to the
+          threshold that produced it; see doc/outlier_trimming.md for how to check.
+        * `cap reached in N/M bins` -- the one genuine warning. It means a bin held more
+          outliers than `trim_max_fraction` permits removing, so the loop stopped on the
+          valve rather than on the threshold and contamination is left in the sample.
+        * `no k-scan plateau in N/M bins` -- the ladder ran to the fully pooled estimate
+          without its ends agreeing. Paired with a large relative error it means the seed
+          sample cannot resolve the tail. On its own it is not necessarily trouble.
+
+        `worst holds X% of a determined bin` is reported only for bins that are at least
+        a 2-sigma measurement. The denominator is a sum with cancellations, so a bin
+        consistent with zero drives the ratio to absurd values -- hundreds of thousands
+        of percent were observed -- that say nothing about the data.
 
         Silent when there is nothing to say, which is the common case.
         """
         worst_obs: str = ""
-        agg = {"bins_flagged": 0, "n_flagged": 0, "max_share": 0.0,
-               "n_trimmed": 0, "bins_no_plateau": 0}
+        agg = {"bins": 0, "bins_flagged": 0, "slots": 0, "n_cand": 0,
+               "n_trimmed": 0, "cap_hit": 0, "max_share": 0.0, "bins_no_plateau": 0}
         for obs, task in mrg_obs_dict.items():
             record = getattr(task, "file_record", None)
             meta = read_json_sidecar(record) if record is not None else None
             diag = meta.get("diag") if isinstance(meta, dict) else None
             if not isinstance(diag, dict):
                 continue
-            for key in ("bins_flagged", "n_trimmed", "bins_no_plateau"):
+            for key in ("bins", "bins_flagged", "slots", "n_cand", "n_trimmed",
+                        "cap_hit", "bins_no_plateau"):
                 agg[key] += int(diag.get(key) or 0)
-            agg["n_flagged"] = max(agg["n_flagged"], int(diag.get("n_flagged") or 0))
             share = float(diag.get("max_share") or 0.0)
             if share > agg["max_share"]:
                 agg["max_share"], worst_obs = share, obs
@@ -260,21 +268,40 @@ class MergePart(DBMerge):
         if not (agg["bins_flagged"] or agg["n_trimmed"] or agg["bins_no_plateau"]):
             return
 
+        pct = lambda a, b: f"{100.0 * a / b:.0f}%" if b else "n/a"
         parts: list[str] = []
         if agg["bins_flagged"]:
+            # > the number that matters is the share of dataset-slots actually removed,
+            # > not the bin count: a heavy-tailed part flags something in almost every
+            # > bin while removing only a few percent of the data
             parts.append(
-                f"outliers flagged in {agg['bins_flagged']} bin(s), up to {agg['n_flagged']} per bin"
-                + (
-                    f", worst carrying {100.0 * agg['max_share']:.0f}% of the integral"
-                    f" ({worst_obs})"
-                    if agg["max_share"] > 0.0
-                    else ""
-                )
+                f"outliers in {agg['bins_flagged']}/{agg['bins']} bins"
+                f" ({pct(agg['bins_flagged'], agg['bins'])})"
             )
-        if agg["n_trimmed"]:
-            parts.append(f"[yellow]{agg['n_trimmed']} discarded[/yellow]")
+            if agg["n_trimmed"]:
+                parts.append(
+                    f"{pct(agg['n_trimmed'], agg['slots'])} of dataset-slots removed"
+                    f" ({agg['n_trimmed']}/{agg['slots']})"
+                )
+            elif agg["n_cand"]:
+                parts.append(f"{agg['n_cand']} flagged, none removed")
+            if agg["max_share"] > 0.0:
+                parts.append(
+                    f"worst holds {100.0 * agg['max_share']:.0f}% of a determined bin"
+                    f" ({worst_obs})"
+                )
+        if agg["cap_hit"]:
+            # > this is the real warning: more outliers than `trim_max_fraction` allows
+            # > removing, so contamination is left in the sample
+            parts.append(
+                f"[yellow]cap reached in {agg['cap_hit']}/{agg['bins']} bins"
+                f" ({pct(agg['cap_hit'], agg['bins'])})[/yellow]"
+            )
         if agg["bins_no_plateau"]:
-            parts.append(f"no k-scan plateau in {agg['bins_no_plateau']} bin(s): more seeds needed")
+            parts.append(
+                f"no k-scan plateau in {agg['bins_no_plateau']}/{agg['bins']} bins"
+                f" ({pct(agg['bins_no_plateau'], agg['bins'])})"
+            )
         self._logger(session, self._logger_prefix + "::run:  " + "; ".join(parts))
 
     def _stage_histograms(
