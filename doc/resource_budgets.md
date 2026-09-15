@@ -201,9 +201,13 @@ something consistent with zero while keeping a perfectly finite error. Its
 relative error is then meaningless and unboundedly large. One measured case:
 
 ```
-abs_yj1_1j_GHS_osss   integral  -0.13 +/- 947.7   ->  |e/r| = 7160
-abs_yj1_2j_GHS_osss   integral   -708 +/-   7.1   ->  |e/r| = 0.010
+observable A   integral  -0.13 +/- 947.7   ->  |e/r| = 7160
+observable B   integral   -708 +/-   7.1   ->  |e/r| = 0.010
 ```
+
+A and B are two differential distributions of the same part. A's bins cancel
+almost exactly against one another, so its integral lands on top of zero while
+keeping the error the bins give it; B's do not.
 
 The old guard was `if r != 0.0`, which catches exact zeros and misses precisely
 this. That single observable set the maximum for its part, and through it the
