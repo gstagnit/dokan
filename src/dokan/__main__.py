@@ -595,6 +595,11 @@ def main() -> None:
             report = tick.run_once(
                 dispatch=not args.no_dispatch, workers=args.workers, merge_concurrent=args.merge_cores
             )
+        except RuntimeError as exc:
+            # > a pre-flight failure: say why on stdout (a scheduler's mail) and in the log
+            with tick.session as session:
+                tick._logger(session, f"Tick::run:  aborted: {exc}", level=LogLevel.ERROR)
+            sys.exit(f"tick: aborted: {exc}")
         finally:
             lease.release()
         if not args.quiet:

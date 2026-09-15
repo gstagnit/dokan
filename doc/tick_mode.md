@@ -59,6 +59,32 @@ than `crontab`, because it carries a valid Kerberos/AFS token:
 */20 * * * * lxplus.cern.ch /path/to/dokan-venv/bin/nnlojet-run tick /path/to/RUN --quiet >> /path/to/RUN/tick.log 2>&1
 ```
 
+**The environment.** A tick inherits the environment of whatever launched it,
+and a scheduler's is bare: no compiler module, no `LD_LIBRARY_PATH`, no
+`LHAPDF_DATA_PATH`.  NNLOJET needs all of that twice over -- on the login node,
+where the tick runs `NNLOJET --adapt` for every finished warmup step, and on the
+worker nodes, which receive the tick's environment through `getenv = True` in the
+submit template.  Launch the tick through a script that loads what your shell
+loads:
+
+```sh
+#!/bin/bash
+# tick.sh -- what ~/.bashrc does for NNLOJET, then one tick
+source /cvmfs/sft.cern.ch/lcg/releases/gcc/15.2.0/x86_64-el9/setup.sh
+export LD_LIBRARY_PATH=/path/to/LHAPDF/install/lib:$LD_LIBRARY_PATH
+export LHAPDF_DATA_PATH=/cvmfs/sft.cern.ch/lcg/external/lhapdfsets/current
+exec /path/to/dokan-venv/bin/nnlojet-run tick "$@"
+```
+
+```
+*/20 * * * * lxplus.cern.ch /path/to/tick.sh /path/to/RUN --quiet >> /path/to/RUN/tick.log 2>&1
+```
+
+A tick checks first that the executable starts at all and aborts with the
+loader's message otherwise, before touching anything; a batch whose collection
+fails for another reason has NNLOJET's output echoed into the workflow log and is
+retried on the next tick.
+
 `nnlojet-run status RUN` prints the live board once, from the database, from
 anywhere.  A tick's own messages go to the log database like the live run's and
 are echoed on its stdout (`--quiet` keeps only the one-line summary).

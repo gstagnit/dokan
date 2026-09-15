@@ -26,7 +26,9 @@ import datetime
 import json
 import multiprocessing
 import os
+import re
 import socket
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +50,11 @@ from .monitor import Monitor
 from .preproduction import JobRef, PreProduction
 from .scheduler import WorkerSchedulerFactory
 from .util import read_json_sidecar, write_json_sidecar
+
+# > what the dynamic loader says when a shared library or a symbol version is missing
+_LOADER_FAILURE = re.compile(
+    r"error while loading shared libraries|version `[^']+' not found|not found \(required by"
+)
 
 _STATE_FILE: str = "tick.json"
 _LEASE_FILE: str = "tick.lease"
@@ -258,6 +265,33 @@ class Tick(DBTask):
                 LogLevel.WARN,
             )
         return ok
+
+    def check_executable(self) -> None:
+        """Fail the tick before it touches anything if NNLOJET cannot start here.
+
+        A tick inherits the environment of whatever launched it, and a scheduler's
+        is bare: no `LD_LIBRARY_PATH` from a compiler module, no PDF path.  NNLOJET
+        then fails at load time -- and it fails twice over, on the login node for
+        the grid adaption of every warmup step, and on the worker nodes for every
+        job the tick would submit with `getenv = True`.  Better one loud line than
+        a campaign of batches skipped for a reason buried in their executor logs.
+        Only a *loader* failure is fatal; anything else NNLOJET says without
+        arguments (usage text, a non-zero code) is its own business.
+        """
+        exe: str = self.config["exe"]["path"]
+        scratch: Path = self._local("tmp")  # > where `init` ran its dry run; NNLOJET writes nothing here
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            probe = subprocess.run([exe], cwd=scratch, capture_output=True, text=True, timeout=120.0)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"cannot start NNLOJET ({exe}): {exc}") from exc
+        if probe.returncode != 0 and _LOADER_FAILURE.search(probe.stderr):
+            raise RuntimeError(
+                f"NNLOJET ({exe}) cannot start in this environment (rc = {probe.returncode}):\n"
+                + probe.stderr.strip()
+                + "\nA tick started by a scheduler must load the same environment as your shell"
+                " (compiler module, LD_LIBRARY_PATH, LHAPDF paths); see doc/tick_mode.md"
+            )
 
     def campaign_complete(self, session: Session) -> bool:
         last_sig = session.scalars(select(Log).where(Log.level < 0).order_by(Log.id.desc())).first()
@@ -473,10 +507,15 @@ class Tick(DBTask):
                 try:
                     exe.finish()
                 except Exception as exc:
-                    self._log(
-                        f"{self._logger_prefix}::reconcile:  {label}: collecting outputs failed: {exc!r}",
-                        LogLevel.ERROR,
-                    )
+                    # > the reason is in the executor's own log (NNLOJET's output, say):
+                    # > surface it here, where `status` and the tick's stdout show it
+                    with self.session as session:
+                        self._echo_exe_log(session, exe.exe_data, label)
+                        self._logger(
+                            session,
+                            f"{self._logger_prefix}::reconcile:  {label}: collecting outputs failed: {exc!r}",
+                            LogLevel.ERROR,
+                        )
                     report.n_skipped += 1
                     continue
                 with self.session as session:
@@ -653,6 +692,7 @@ class Tick(DBTask):
             self._logger(
                 session, f"{self._logger_prefix}::run:  tick on {socket.gethostname()}", LogLevel.DEBUG
             )
+        self.check_executable()
 
         # > 2. reconcile
         unsubmitted: list[Executor] = self.reconcile(report)

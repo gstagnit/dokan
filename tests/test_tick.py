@@ -394,3 +394,19 @@ def test_15_config_detached_is_never_persisted(run: Run):
     config = read_config_json(run.path / "config.json")
     assert "detached" not in config["run"]
     assert re.search(r'"jobs_batch_size"', (run.path / "config.json").read_text()) is None
+
+
+def test_16_bare_environment_aborts_before_touching_anything(run: Run, tmp_path):
+    # > an executable that cannot load: what a scheduler-launched tick sees when the
+    # > compiler module of the user's shell is missing.  The fake fails like the loader.
+    exe = tmp_path / "NNLOJET"
+    exe.write_text(
+        '#!/bin/sh\necho "$0: /lib64/libstdc++.so.6: version \\`GLIBCXX_3.4.32\' not found" >&2\nexit 1\n'
+    )
+    exe.chmod(0o755)
+    before = run.jobs()
+    proc = run.cli("--exe", str(exe), "tick", str(run.path), check=False)
+    assert proc.returncode != 0
+    assert "cannot start in this environment" in _plain(proc.stdout + proc.stderr)
+    assert run.jobs() == before
+    assert not (run.path / "tick.lease").exists()
