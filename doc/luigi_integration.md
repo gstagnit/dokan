@@ -120,8 +120,8 @@ every fork), it is linear, and it continues while the run is essentially idle �
 seven log records in ten minutes, no new rows in the log database, and the
 monitor opening a fresh session per refresh. That combination rules out per-task
 retention, log accumulation and a long-lived identity map. The cause is not yet
-identified; finding it wants `tracemalloc` or `gc` object-count sampling from
-inside a running orchestrator, not more inference from `smaps`.
+identified. `doc/orchestrator_memory.md` collects everything measured, what is
+ruled out, and how to find it.
 
 The fix below is still worth having on its own terms — it removes a real
 per-instance cost and a real per-call cost — but **restarting before a long

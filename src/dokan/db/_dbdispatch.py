@@ -586,10 +586,18 @@ class DBDispatch(DBTask):
                 # > an up-to-date result, not a from-scratch re-merge of every observable
                 # > (that remains the explicit `finalize` CLI path)
                 signal_tasks.append(self.clone(MergeAll, force=True, finalize=True))
-        # > the periodic refresh yields the *same* task, so a signal arriving in the same
-        # > round makes this a no-op rather than a second merge
+        # > The periodic refresh is a *snapshot*: it writes the per-order files from the
+        # > part results that exist right now.  It must NOT force, because `force=True`
+        # > makes `MergeAll.requires()` return every `MergePart`, and during production
+        # > those go incomplete again the moment new jobs land -- so Luigi's
+        # > `check_unfulfilled_deps` raises
+        # >     RuntimeError: Unfulfilled dependency at run time: MergePart_...
+        # > between scheduling the task and running it.  Observed on roughly half the
+        # > hourly attempts of two live campaigns.  Unforced, `requires()` is empty,
+        # > there is nothing to race against, and the ordinary merges that `MergePart`
+        # > drives keep the part files current anyway.
         if not signal_tasks and (fini_tag := self._due_periodic_finalize(session)) > 0.0:
-            signal_tasks.append(self.clone(MergeAll, force=True, finalize=True, fini_tag=fini_tag))
+            signal_tasks.append(self.clone(MergeAll, force=False, finalize=True, fini_tag=fini_tag))
         return signal_tasks
 
     def _with_dispatch_continuation(self, tasks: list[luigi.Task]) -> list[luigi.Task]:

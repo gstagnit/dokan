@@ -52,8 +52,17 @@ lives rather than from an explicit check:
   never fire one — which matters, since a finalize during pre-production would
   compete for local cores with the warmup it is waiting on, and every order
   would be skipped as incomplete anyway.
-* **One merge, not two.** The periodic refresh yields the same task a merge
-  signal does, so a signal arriving in the same round makes the timer a no-op.
+* **One merge, not two.** The periodic refresh and a merge signal are handled in
+  the same round, so a signal arriving alongside the timer makes the timer a
+  no-op.
+* **It does not force.** A merge signal yields `MergeAll(force=True, ...)`,
+  whose `requires()` is every `MergePart`; during production those go incomplete
+  again as soon as new jobs land, so Luigi's `check_unfulfilled_deps` raises
+  `Unfulfilled dependency at run time: MergePart_...` between scheduling the
+  task and running it -- observed on roughly half the hourly attempts of two
+  live campaigns. The timer therefore yields `force=False`: `requires()` is
+  empty, nothing races, and the snapshot is written from the part files as they
+  stand, which is what a periodic view should be.
 
 The clock is the newest `SIG_FINI` log entry, which the `finalize` CLI also
 writes, so a manual finalize postpones the next automatic one. Clearing the log
