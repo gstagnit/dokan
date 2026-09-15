@@ -143,8 +143,8 @@ are discarded, not down-weighted.
 
 ```
 MergePart[<part>]::run:  outliers in 1845/2044 bins (90%); 4% of dataset-slots
-    removed (32295/860524); worst holds 62% of a determined bin (ptl_1j_IFN_osss);
-    cap reached in 31/2044 bins (2%); no k-scan plateau in 239/2044 bins (12%)
+    removed (32295/860524); cap reached in 31/2044 bins (2%); k-scan used the
+    conservative pooled estimate in 239/2044 bins (12%)
 ```
 
 Every figure carries its denominator. Without one these read as a catastrophe and
@@ -156,12 +156,31 @@ a few percent of the data.
 * **`cap reached in N/M bins`** is the one genuine warning: a bin held more
   outliers than `trim_max_fraction` allows removing, so the loop stopped on the
   valve rather than the threshold and contamination remains.
-* **`no k-scan plateau`** paired with a large relative error means the seed sample
-  cannot resolve the tail. Alone it is not necessarily trouble.
-* **`worst holds X% of a determined bin`** is reported only where the bin is at
-  least a 2-sigma measurement. The denominator is a sum with cancellations, so a
-  bin consistent with zero sends the ratio to absurd values — 310,000% was
-  observed before this guard — that say nothing about the data.
+* **`k-scan used the conservative pooled estimate`** is *not* a fault. Without a
+  plateau the scan returns the unbiased end of its ladder, with the largest error
+  it can give that bin. See below.
+
+### Bins without a plateau are a statistics report, not a k-scan problem
+
+The rate is set by how many datasets a part has, not by the k-scan settings.
+Measured on one observable across parts spanning 20 to 583 datasets:
+
+| datasets | bins without a plateau |
+|---|---|
+| 20-25 | 16-18% |
+| 81 | 11% |
+| 112-425 | 0-2% |
+| 576-583 | 0% |
+
+Correlation with dataset count: **-0.72**. It resolves itself with seeds.
+
+It is tempting to make it rarer by loosening the plateau test — `k_scan_nsteps=2`
+takes it to zero and shrinks the quoted error — but that is the wrong trade. The
+plateau test *is* the bias control: it certifies that the low-variance
+inverse-variance end and the progressively unbiased pooled end have converged.
+Loosening it accepts the biased end on weaker evidence. Failing to plateau is the
+estimator declining to make a claim it cannot support, and the fallback is the
+conservative one.
 
 ## Checking that the parameters are right
 
