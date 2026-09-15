@@ -9,6 +9,18 @@ from luigi import rpc, scheduler, worker
 # > long-running worker grow without limit.
 _TASK_HISTORY_MAX: int = 10000
 
+# > cap on `Worker._get_work_response_history`.  Luigi appends the scheduler's
+# > reply to *every* `get_work` call -- and the worker polls whenever it has
+# > running tasks and nothing to schedule, i.e. continuously.  Each reply carries
+# > one dict per running task (id, worker string, host, user, pid, ...), so with
+# > ~100 tracking forks a reply retains ~28 kB, and at ~9 polls/s (a 0.1 s wait
+# > interval) that is ~0.9 GB/h of heap that the parent then shares into every
+# > fork.  This was the orchestrator's "idle" memory growth, see
+# > `doc/orchestrator_memory.md`.  Only `luigi.execution_summary` reads the list,
+# > and there only to name tasks run by *other* workers, which a single local
+# > worker never has -- so a short tail is exactly as informative as the whole.
+_GET_WORK_HISTORY_MAX: int = 100
+
 
 class WorkerSchedulerFactory:
     """Factory adapter for Luigi worker/scheduler construction.
@@ -62,12 +74,14 @@ class WorkerSchedulerFactory:
     def create_worker(self, scheduler, worker_processes, assistant=False):
         """Create a Luigi worker with configured polling/check behavior.
 
-        The worker's task history is capped (see `_TASK_HISTORY_MAX`).  Luigi grows
-        it forever otherwise: one entry per status change, each holding a reference
-        to the task, drained only by the end-of-run execution summary.  A `deque`
-        supports everything `execution_summary` does with it (iteration and `[0]`),
-        so the only consequence is that the summary describes the recent tail rather
-        than the whole run.
+        Two of the worker's histories are capped (see `_TASK_HISTORY_MAX` and
+        `_GET_WORK_HISTORY_MAX`).  Luigi grows both forever otherwise: the task
+        history gets one entry per status change, each holding a reference to the
+        task; the get-work history gets one entry per scheduler poll, each holding a
+        dict per running task.  Both are drained only by the end-of-run execution
+        summary.  A `deque` supports everything `execution_summary` does with them
+        (iteration and `[0]`), so the only consequence is that the summary describes
+        the recent tail rather than the whole run.
         """
         w = worker.Worker(
             scheduler=scheduler,
@@ -81,4 +95,5 @@ class WorkerSchedulerFactory:
             ping_interval=self.ping_interval,
         )
         w._add_task_history = collections.deque(maxlen=_TASK_HISTORY_MAX)
+        w._get_work_response_history = collections.deque(maxlen=_GET_WORK_HISTORY_MAX)
         return w

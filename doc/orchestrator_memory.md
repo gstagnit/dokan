@@ -1,10 +1,11 @@
-# The orchestrator's memory growth (unresolved)
+# The orchestrator's memory growth (diagnosed)
 
-The `submit` process grows at roughly **0.9 GB/hour**, linearly, for as long as it
-runs. This is the single largest operational hazard in a long campaign and it is
-**not yet diagnosed**. This document records what is measured, what has been
-ruled out, what was tried and failed, and how to actually find it — so the next
-attempt does not repeat this one.
+The `submit` process grew at roughly **0.9 GB/hour**, linearly, for as long as it
+ran. This was the single largest operational hazard in a long campaign. It is now
+diagnosed — the cause is in Luigi's worker, not in dokan's tasks — and bounded in
+`dokan/scheduler.py`; see "The cause" below. The measurements, the ruled-out
+hypotheses and the failed attempt are kept because they are what pointed at it,
+and because the same reasoning applies to the next one.
 
 ## What it costs
 
@@ -110,37 +111,119 @@ after.
 The memoisation is kept regardless — it removes a genuine per-instance cost and
 is ~60x faster per call — but it is not this.
 
-## How to actually find it
+## The cause
 
-Stop inferring from `/proc`. `smaps` can say *what kind* of memory is growing and
-has now said all it can. The next step is from inside the process:
+`luigi.worker.Worker._get_work_response_history`. Every call to `Worker._get_work`
+ends with
 
-1. Add an opt-in debug hook to `submit` that, every N minutes, logs
-   `tracemalloc.take_snapshot().compare_to(previous, 'lineno')[:20]` and
-   `len(gc.get_objects())` broken down by `type(...).__name__`. Both are cheap
-   enough to leave running for an hour.
-2. Run a single campaign with it for two hours. A linear 0.9 GB/h leak is ~1.8 GB
-   of growth — trivially visible in a tracemalloc diff.
-3. The prime suspects, given that it grows while idle, are the loops that run
-   regardless of work: `DBDispatch._poll_dispatch_signals_until`, the `Monitor`
-   refresh, and the `DBRunner` executor polling. Look for an accumulator in one
-   of those — a list appended per poll, a cached session, a rich renderable
-   retained by the `Live` display.
+```python
+self._get_work_response_history.append({"task_id": task_id, "running_tasks": running_tasks})
+```
 
-Until then, the mitigation below is the answer.
+where `running_tasks` is what `Scheduler.count_pending` builds for the reply: one
+fresh dict per task currently RUNNING — `task_id`, the worker string, `host`,
+`username`, `pid`, `workers`. The list is never drained. Its only reader is
+`luigi.execution_summary._get_external_workers`, at the end of the run, and only to
+name tasks that *other* workers ran — which a single local worker never has.
 
-## Mitigation (current practice)
+The worker calls `_get_work` continuously. Once it has running tasks and nothing
+left to schedule, its main loop is: ask the scheduler for work (nothing), wait
+`wait_interval` on the result queue (nothing), repeat. dokan's factory set
+`wait_interval = 0.1`, so the poll ran about nine times a second, and the submit
+orchestrator lives in exactly that state — it *is* a parent of ~100 tracking forks
+with nothing to schedule between batch-job completions.
 
-* **Restart the orchestrator periodically** — every 8-12 hours on a 34 GB limit.
-  A restart is cheap and designed for: the database holds the state, in-flight
-  jobs are re-attached by `DBResurrect`, and the heap starts from zero. This is
-  hygiene on a long campaign, not a failure.
-* **Restart before a final merge.** That is the fork-heavy phase and therefore
-  where the accumulated heap does the most damage.
-* **Keep `jobs_max_concurrent` sized to the forks, not the batch system.** The
-  fork count is roughly `jobs_max_concurrent / jobs_batch_size`. Two campaigns at
-  2000 concurrent with a batch size of 23 gave ~174 forks, which matched the 190
-  processes observed at the OOM. Halving the concurrency halves the forks.
+That matches every constraint above:
+
+* it grows while idle, at a constant rate, because the rate is set by the poll
+  interval and the fork count, not by work;
+* it is anonymous heap in the parent, shared into every fork made afterwards;
+* it did not move when the per-task retention was cut 45x, because it is not
+  per task, it is per poll;
+* it did not show in the log database, the sessions, or the merges.
+
+Measured offline with Luigi 3.8.1, a local scheduler and one worker, by calling
+`get_work` the way the loop does and tracing the heap:
+
+| running tasks | retained per poll | at 9 polls/s |
+|---|---|---|
+| 100 | 27.6 kB | 0.89 GB/h |
+| 200 | 54.9 kB | 1.78 GB/h |
+
+The production campaigns above had ~100 forks each and grew at 0.80–0.99 GB/h.
+Re-sampled on two fresh campaigns while this was being written, 111 s apart,
+forty minutes in:
+
+| forks | parent RSS growth | rate |
+|---|---|---|
+| 95 | 28.1 MB | 0.91 GB/h |
+| 130 | 37.5 MB | 1.22 GB/h |
+
+The rate scales with the fork count, as it must if it is per poll x per running
+task. (By then the parent's heap was already 90% private rather than shared:
+the forks predate most of it, and what they do share the parent keeps
+rewriting.)
+
+Why it was not found sooner: the arithmetic in "The attempt that failed" says a
+per-poll accumulator was the only kind that could fit, and `worker.py` has exactly
+one `list.append` on the poll path. The same reasoning that ruled out per-task
+retention would have found it — the lesson stands.
+
+## The fix
+
+`WorkerSchedulerFactory.create_worker` replaces the list with
+`collections.deque(maxlen=100)`, exactly as it already did for
+`_add_task_history`. `execution_summary` only iterates the structure, so nothing
+else changes. The retained heap is now flat at roughly `100 x (per-poll size)`,
+under 3 MB for 100 forks.
+
+The submit orchestrator also now runs the worker at Luigi's own defaults,
+`wait_interval = 1.0` and `ping_interval = 1.0`, instead of the factory's 0.1 s.
+Each idle round prunes and re-sorts the whole task table (which, as noted below,
+Luigi never shrinks while the worker lives) and `waitpid`s every child; at ten
+rounds a second that was the parent's ~5% of a login-node core for no benefit.
+A result that arrives on the queue is handled immediately regardless of the
+interval, and the forks poll HTCondor once per `htcondor_poll_time` (100 s), so
+the extra 0.9 s of worst-case scheduling latency is invisible. The local-execution
+and finalize builds keep 0.1 s, where the tasks are short and the latency matters.
+
+**Status.** The offline measurement reproduces the production rate to within the
+fork count, and the bounded history is verified through Luigi's real `_get_work`
+path (1000 polls, history length 100, heap flat). The production confirmation —
+a campaign started on the fixed build holding a flat RSS over several hours — is
+still to be recorded here. Note that the installed `dokan-venv` is a plain (not
+editable) install: the fix reaches a campaign only after `pip install` into the
+venv and a restart of that campaign's `submit`.
+
+## What remains
+
+The fixed orchestrator is small and flat, but the forks are not free, and on a
+shared login node they are now the dominant cost:
+
+* **One process per in-flight batch of jobs**, ~15–45 MB private each after
+  copy-on-write drift, plus its share of the parent. ~100 forks is ~2–4 GB of
+  real footprint per campaign. The lever is the batch size: the fork count is
+  roughly `jobs_max_concurrent / jobs_batch_size`, summed per part. The batch
+  size is *derived* at submit (`2 * (jobs_max_concurrent // nparts) + 1`, which
+  is 11 for 1000 jobs over 180 parts) and the value in `config.json` is
+  overwritten; `submit --jobs-batch-size N` overrides it, subject to the same
+  floor (`jobs_batch_unit_size`) and pool clamp. Measured on a campaign with 19
+  parts in flight: 11 -> 102 forks, 25 -> 54, 50 -> 34, 100 -> 19. A batch holds
+  its slots until its slowest job ends (max/mean wall time 1.15–1.5 in 23-job
+  clusters), so 25–50 is the sensible range.
+* **One `condor_q -json <cluster>` per fork per `htcondor_poll_time`.** With two
+  campaigns at ~100 forks and 100 s, that is one `condor_q` process start per
+  second on the login node, and four or five in flight at any instant. A single
+  poller per campaign asking `condor_q` once for all clusters would remove almost
+  all of it; it is an architectural change to `HTCondorExec`, not a setting.
+* **Every fork inherits the parent's pipe fds** (~2 per sibling), which is why the
+  open-file limit is raised at startup. Harmless for memory, but it is why the
+  soft limit has to be ~10 x `nworkers`.
+
+The mitigation that used to be mandatory — restart every 8–12 hours — is no
+longer needed for memory. A restart before a final merge is still cheap and still
+where accumulated fork drift does the most damage, so it remains good practice on
+a very long campaign.
 
 ## The orphaned-job wedge
 

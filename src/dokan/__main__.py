@@ -354,6 +354,15 @@ def main() -> None:
     parser_submit.add_argument(
         "--jobs-max-concurrent", type=int, help="maximum number of concurrently running jobs"
     )
+    parser_submit.add_argument(
+        "--jobs-batch-size",
+        type=int,
+        metavar="N",
+        help="maximum number of seeds of one part dispatched as a single batch, i.e. one "
+        "batch-system cluster tracked by one orchestrator process (default: derived from "
+        "jobs-max-concurrent and the number of active parts, 2*(max//parts)+1); larger "
+        "batches mean fewer tracking processes, capped at jobs-max-concurrent",
+    )
     parser_submit.add_argument("--seed-offset", type=int, help="seed offset")
     parser_submit.add_argument("--local-cores", type=int, help="maximum number of local cores")
     parser_submit.add_argument(
@@ -1205,13 +1214,30 @@ def main() -> None:
         # > deadlock (an oversized batch is never schedulable -> jobs stay stuck
         # > DISPATCHED and the dispatcher throttles forever). Triggers when
         # > `nactive_part` is small: 1 part -> 2*jobs_max+1, 2 parts -> jobs_max+1.
+        # >
+        # > `--jobs-batch-size` overrides the derived value: the derivation targets a
+        # > continuous optimisation (several batches per part per wave), but every batch
+        # > is one Luigi fork on the submit host for as long as its jobs run, so a large
+        # > campaign over many parts may prefer fewer, larger batches.  The override is
+        # > subject to the same floor and the same pool clamp.
+        batch_size_want: int = (
+            args.jobs_batch_size
+            if args.jobs_batch_size is not None and args.jobs_batch_size > 0
+            else 2 * (jobs_max // nactive_part) + 1
+        )
         config["run"]["jobs_batch_size"] = min(
             max(
-                2 * (jobs_max // nactive_part) + 1,
+                batch_size_want,
                 config["run"]["jobs_batch_unit_size"],
             ),
             jobs_max,
         )
+        if args.jobs_batch_size is not None and config["run"]["jobs_batch_size"] != args.jobs_batch_size:
+            console.print(
+                f"[yellow]--jobs-batch-size {args.jobs_batch_size} adjusted to"
+                f" {config['run']['jobs_batch_size']} (floor: batch unit"
+                f" {config['run']['jobs_batch_unit_size']}, cap: {jobs_max} concurrent jobs)[/yellow]"
+            )
         if config["exe"]["policy"] == ExecutionPolicy.SLURM:
             config["run"]["jobs_batch_size"] = min(config["run"]["jobs_batch_size"], 1000)
 
@@ -1277,7 +1303,17 @@ def main() -> None:
                 cache_task_completion=False,  # needed for MergePart
                 check_complete_on_run=False,
                 check_unfulfilled_deps=True,
-                wait_interval=0.1,
+                # > Luigi's defaults, not the factory's 0.1 s.  The submit orchestrator
+                # > spends its life with ~`nworkers` forks running and nothing to
+                # > schedule, and in that state the worker loop is: ask the scheduler
+                # > for work, wait `wait_interval` on the result queue, repeat.  Every
+                # > iteration prunes and re-sorts the whole task table and polls each
+                # > child; at 0.1 s that is ~9 rounds/s of pure overhead on a login
+                # > node, for forks that themselves poll the batch system once per
+                # > `htcondor_poll_time`.  A result that arrives is handled at once
+                # > regardless of the interval, so 1 s costs nothing in latency.
+                wait_interval=1.0,
+                ping_interval=1.0,
             ),
             detailed_summary=True,
             workers=nworkers,
