@@ -739,8 +739,32 @@ class MergePart(DBMerge):
                 )
             rel_cross_err = min_rel_err
 
-        cross_list.append((1.0, min_rel_err))  # safe guard against all-zero case
-        max_rel_hist_err: float = max(abs(e / r) for r, e in cross_list if r != 0.0)
+        # > Worst relative error over the observables -- but only over those that are
+        # > actually a *measurement*.  Each entry is an observable's integral, and a
+        # > differential distribution with large bin-to-bin cancellations can integrate
+        # > to something consistent with zero while keeping a perfectly finite error.
+        # > Its relative error is then meaningless and unboundedly large: one observed
+        # > case had an integral of -0.13 +/- 947.7, giving |e/r| = 7160, which set this
+        # > maximum and through it the part's whole optimisation error (70,415 against a
+        # > cross section of -947.7 +/- 730.8).  Guarding only on `r != 0.0` catches
+        # > exact zeros and misses precisely this.
+        # >
+        # > The consequences were not cosmetic: `_distribute_jobs` allocates by
+        # > `Part.error`, so such a part soaks up the entire budget chasing a relative
+        # > error that cannot improve -- the denominator is zero by cancellation, not by
+        # > lack of statistics -- and the run's reported accuracy and `T_target` are
+        # > nonsense (39.3% and 11200 kh, against a cross section determined to 1.1%).
+        _HIST_SIGNIFICANCE: float = 2.0
+        significant: list[tuple[float, float]] = [
+            (r, e) for r, e in cross_list if r != 0.0 and abs(r) > _HIST_SIGNIFICANCE * e
+        ]
+        # > Nothing significant: the histograms say nothing about how well this part is
+        # > determined, so optimise on the cross section alone rather than inventing a
+        # > number.  (The old code appended a synthetic `(1.0, 1e-9)` entry to keep the
+        # > max non-empty; that would now make such a part look perfectly determined.)
+        max_rel_hist_err: float = (
+            max(abs(e / r) for r, e in significant) if significant else rel_cross_err
+        )
         if opt_target == "cross":
             pass  # keep cross error for optimisation
         elif opt_target == "cross_hist":

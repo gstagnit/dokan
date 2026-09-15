@@ -183,6 +183,69 @@ against it means much. Read the estimate together with the per-part errors
 carries almost all of `tot_error`, that part, not the budget, is the thing to
 deal with.
 
+### The accuracy being reported is not the cross-section error
+
+`run.opt_target` selects what the run optimises towards and reports. The default
+`cross_hist` is
+
+```python
+rel_cross_err = sqrt(rel_cross_err * max_rel_hist_err)
+```
+
+a geometric mean of the cross section's own relative error and the **worst**
+relative error over the observables. `max_rel_hist_err` is taken over each
+observable's *integral*, and that is where it used to go wrong.
+
+A differential distribution with large bin-to-bin cancellations can integrate to
+something consistent with zero while keeping a perfectly finite error. Its
+relative error is then meaningless and unboundedly large. One measured case:
+
+```
+abs_yj1_1j_GHS_osss   integral  -0.13 +/- 947.7   ->  |e/r| = 7160
+abs_yj1_2j_GHS_osss   integral   -708 +/-   7.1   ->  |e/r| = 0.010
+```
+
+The old guard was `if r != 0.0`, which catches exact zeros and misses precisely
+this. That single observable set the maximum for its part, and through it the
+part's whole optimisation error: 70,415 against a cross section of
+`-947.7 +/- 730.8`.
+
+The damage was not cosmetic. `_distribute_jobs` allocates by `Part.error`, so such
+a part accounts for ~100% of the quadrature error sum and soaks up the entire
+remaining budget chasing a relative error that *cannot* improve — the denominator
+is zero by cancellation, not by lack of statistics. The run then reports an
+accuracy and a `T_target` that describe nothing real.
+
+An observable must now be a measurement before its relative error may set the
+maximum:
+
+```python
+significant = [(r, e) for r, e in cross_list if r != 0.0 and abs(r) > 2.0 * e]
+max_rel_hist_err = max(abs(e / r) for r, e in significant) if significant else rel_cross_err
+```
+
+When nothing is significant the part is optimised on its cross section alone,
+which is the honest degradation — the histograms genuinely say nothing about how
+well it is determined. (The previous code appended a synthetic `(1.0, 1e-9)`
+entry to keep the maximum non-empty; with the filter in place that would instead
+make such a part look perfectly determined, so it is gone.)
+
+Measured across two campaigns of 180 parts each:
+
+| | reported accuracy before | after | actual cross-section error |
+|---|---|---|---|
+| campaign A | 39.3% | **0.71%** | 1.13% |
+| campaign B | 2.6% | **1.09%** | 1.41% |
+
+with a median of 16 and 12 significant observables per part respectively, and 36
+parts in each falling back to the cross error — the near-empty channels that are
+excluded from the budget anyway.
+
+Note that `cross_hist` can legitimately come out *below* the cross-section error:
+it is a geometric mean, so histograms that are relatively better determined pull
+it down. That is the existing design of the target, not a side effect of this
+guard.
+
 ### Units
 
 CPU budgets are reported in hours, or kilo-hours once large (`format_cpu_time`),
