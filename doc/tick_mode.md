@@ -10,10 +10,10 @@ what the replacement costs (measured), and which parts are not yet solved.
 poor fit:
 
 * the node may be rebooted or the session disconnected, and the campaign stops;
-* the process grows without bound (see `orchestrator_memory.md`), so a long
-  campaign eventually meets the per-user memory limit;
-* it forks a tracking process per in-flight batch, which is what turns that
-  growth into an out-of-memory event and draws complaints from site monitoring;
+* it forks a tracking process per in-flight batch, and that fork population --
+  together with one `condor_q` per fork per poll interval -- is the dominant
+  remaining footprint on the node, and what draws complaints from site
+  monitoring (see `orchestrator_memory.md`);
 * if those tracking processes are killed, their jobs stay `RUNNING` in the
   database forever and the dispatcher throttles against phantoms -- a campaign
   has sat wedged for nine hours this way with one real batch job left.

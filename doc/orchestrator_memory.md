@@ -225,6 +225,11 @@ longer needed for memory. A restart before a final merge is still cheap and stil
 where accumulated fork drift does the most damage, so it remains good practice on
 a very long campaign.
 
+Note that the two costs left above — the fork population and the `condor_q` poll
+rate — both exist only because the orchestrator stays alive to track jobs.
+`tick_mode.md` proposes removing that requirement entirely, which would retire
+both rather than tune them.
+
 ## The orphaned-job wedge
 
 Worth stating separately because it is the failure this leak actually produces,
