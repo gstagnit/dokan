@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session  # , scoped_session, sessionmaker
 from ..exe import ExecutionMode, ExecutionPolicy, ExeData
 from ..task import Task
 from ._jobstatus import JobStatus
+from ._dbopt import hist_objective
 from ._loglevel import LogLevel
 from ._sqla import DokanDB, DokanLog, Job, Log, Part
 
@@ -618,6 +619,35 @@ class DBTask(Task, metaclass=ABCMeta):
             )
             del cache[part_id]
 
+        # > `hist` / `cross_hist`: replace the per-part figures by every part's error on *one*
+        # > merged target quantity (see `hist_objective`), which is what the E-L formula below
+        # > assumes; the per-part figures remain the fallback while nothing is significant yet
+        objective = None
+        if self.config["run"]["opt_target"] != "cross":
+            names: dict[int, str] = {
+                pt.id: pt.name for pt in session.scalars(select(Part).where(Part.active.is_(True)))
+            }
+            try:
+                objective = hist_objective(
+                    self._path, self.config, {pid: names[pid] for pid in cache if pid in names}
+                )
+            except (OSError, ValueError) as exc:
+                self._logger(
+                    session,
+                    f"DBTask::_distribute_time:  optimisation target unavailable ({exc}):"
+                    " falling back to the per-part figures",
+                    LogLevel.WARN,
+                )
+            if objective is not None:
+                for part_id, err in objective.errors.items():
+                    cache[part_id]["error"] = err
+                self._debug(
+                    session,
+                    f"DBTask::_distribute_time:  target {objective.label} ="
+                    f" {objective.value:.6e} +/- {objective.error:.3e} (rel {objective.rel_error:.3e},"
+                    f" scale {objective.scale:.3e}); {len(objective.errors)}/{len(cache)} parts",
+                )
+
         # > check every active part has an entry; compute the min/max/avg error; accumulate tot result & error
         pt_min_error: float = math.inf
         pt_max_error: float = -math.inf
@@ -675,6 +705,7 @@ class DBTask(Task, metaclass=ABCMeta):
         # > populate accumulators to evaluate the E-L optimization formula
         result = {
             "part": {},  # part_id -> {tau, tau_err, T_opt, T_max_job, T_job, njobs, ntot_job}
+            "target": objective.label if objective is not None else self.config["run"]["opt_target"],
             "tot_result": 0.0,
             "tot_error": 0.0,
             "tot_error_estimate_opt": 0.0,

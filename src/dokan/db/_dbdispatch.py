@@ -414,8 +414,8 @@ class DBDispatch(DBTask):
             )
             opt_dist: dict = self._distribute_time(session, T_next)
 
-            # > interrupt when target accuracy reached
-            # @todo does not respect the optimization target yet?
+            # > interrupt when target accuracy reached (`tot_error` is on the optimisation
+            # > target: the cross section, or the worst merged bin/integral for `hist`)
             rel_acc: float = safe_rel_error(opt_dist["tot_error"], opt_dist["tot_result"])
             adj_rel_acc: float = safe_rel_error(opt_dist["tot_adj_error"], opt_dist["tot_result"])
             if rel_acc <= self.config["run"]["target_rel_acc"]:
@@ -424,7 +424,7 @@ class DBDispatch(DBTask):
                     self._logger_prefix
                     + "::repopulate:  "
                     + f"rel_acc = {rel_acc} (adj_rel_acc = {adj_rel_acc})"
-                    + f" vs. {self.config['run']['target_rel_acc']}",
+                    + f" on {opt_dist.get('target')} vs. {self.config['run']['target_rel_acc']}",
                 )
                 # > need to clear all queued jobs so `complete` state is set
                 for job in session.scalars(self.select_job.where(Job.status == JobStatus.QUEUED)):

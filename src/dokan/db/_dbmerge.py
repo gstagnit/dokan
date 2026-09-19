@@ -12,7 +12,6 @@ import re
 import shutil
 import time
 from abc import ABCMeta
-from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -35,6 +34,7 @@ from ..merge._core import (
 )
 from ..order import Order
 from ..util import format_cpu_time, read_json_sidecar, write_json_sidecar
+from ._dbopt import ObsFigure, opt_target_label, optimisation_error, read_obs_figure
 from ._dbtask import DBTask
 from ._jobstatus import JobStatus
 from ._loglevel import LogLevel
@@ -62,104 +62,6 @@ from ._sqla import Job, Log, Part
 # > mismatch against the runcard, say) is a genuine inconsistency and stays fatal.
 _HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
 
-# > An observable (or a bin of one) must be a *measurement* before its relative error
-# > may steer the optimisation: `|value| > _HIST_SIGNIFICANCE * error`.  A differential
-# > distribution with large bin-to-bin cancellations can integrate to something
-# > consistent with zero while keeping a perfectly finite error, and its relative error
-# > is then meaningless and unboundedly large: one observed case had an integral of
-# > -0.13 +/- 947.7, giving |e/r| = 7160, which set the maximum for its part and through
-# > it the part's whole optimisation error (70,415 against a cross section of
-# > -947.7 +/- 730.8).  Guarding only on `r != 0.0` catches exact zeros and misses
-# > precisely this.  The consequences were not cosmetic: `_distribute_time` allocates
-# > by `Part.error`, so such a part soaks up the entire budget chasing a relative error
-# > that cannot improve -- the denominator is zero by cancellation, not by lack of
-# > statistics -- and the run's reported accuracy and `T_target` are nonsense (39.3%
-# > and 11200 kh, against a cross section determined to 1.1%).
-_HIST_SIGNIFICANCE: float = 2.0
-
-
-@dataclass(frozen=True)
-class ObsFigure:
-    """One observable's contribution to a part's optimisation error.
-
-    `result` / `error` are the integral over the distribution (the bare number for
-    a total cross section); `bins` are the in-range bins' `(value, error)` for a
-    differential distribution, empty otherwise.  The overflow is part of the
-    integral but not of `bins`: it is rarely what a run is after, and it is often
-    the worst-determined bin, which would let it steer the whole part.
-    """
-
-    name: str
-    result: float
-    error: float
-    bins: tuple[tuple[float, float], ...] = ()
-
-    @staticmethod
-    def _rel(value: float, error: float) -> float | None:
-        """Relative error of a measurement; None when it is not one."""
-        if value == 0.0 or abs(value) <= _HIST_SIGNIFICANCE * error:
-            return None
-        return abs(error / value)
-
-    def rel_error(self, *, per_bin: bool = False) -> float | None:
-        """The worst relative error this observable asks the optimiser to bring down.
-
-        By integral, or (`per_bin`) by its worst significant bin -- falling back
-        to the integral for an observable without differential bins.  None when
-        nothing about it is a measurement yet.
-        """
-        if per_bin and self.bins:
-            rels = [rel for value, error in self.bins if (rel := self._rel(value, error)) is not None]
-            if rels:
-                return max(rels)
-        return self._rel(self.result, self.error)
-
-
-def optimisation_error(
-    figures: list[ObsFigure],
-    rel_cross_err: float,
-    opt_target: str,
-    *,
-    opt_observables=(),
-    opt_bins: bool = False,
-) -> tuple[float, float]:
-    """`(relative error to optimise on, worst histogram relative error)` of one part.
-
-    The histogram figure is the worst relative error over the observables -- all of
-    them, or only those in `opt_observables` -- each judged by its integral or, with
-    `opt_bins`, by its worst significant bin.  Nothing significant among them: the
-    histograms say nothing yet about how well this part is determined, so the part
-    is optimised on its cross section alone rather than on an invented number.  (An
-    earlier version appended a synthetic `(1.0, 1e-9)` entry to keep the maximum
-    non-empty; with the significance filter that would make such a part look
-    perfectly determined.)
-
-    `opt_target` then combines the two: `cross` ignores the histograms, `hist` uses
-    them alone, `cross_hist` takes the geometric mean -- the histogram figure is a
-    worst case, so a plain mean would over-weight it.
-    """
-    selected: set[str] = set(opt_observables or ())
-    candidates = [fig for fig in figures if not selected or fig.name in selected]
-    rels: list[float] = [rel for fig in candidates if (rel := fig.rel_error(per_bin=opt_bins)) is not None]
-    max_rel_hist_err: float = max(rels) if rels else rel_cross_err
-    if opt_target == "cross":
-        return rel_cross_err, max_rel_hist_err
-    if opt_target == "cross_hist":
-        return math.sqrt(rel_cross_err * max_rel_hist_err), max_rel_hist_err
-    if opt_target == "hist":
-        return max_rel_hist_err, max_rel_hist_err
-    raise ValueError(f"unknown opt_target {opt_target!r}")
-
-
-def opt_target_label(config: dict) -> str:
-    """The target as reported next to the accuracy: `hist[ptl_1j]`, `cross_hist`, ..."""
-    run: dict = config["run"]
-    label: str = str(run["opt_target"])
-    if label != "cross" and (selected := run.get("opt_observables")):
-        label += "[" + ",".join(selected) + ("; bins" if run.get("opt_bins") else "") + "]"
-    elif label != "cross" and run.get("opt_bins"):
-        label += "[bins]"
-    return label
 
 
 # > How often `MergePart` may re-yield an unchanged pending set before giving up.  Each
@@ -766,53 +668,18 @@ class MergePart(DBMerge):
         cross_error: float = 0.0
         figures: list[ObsFigure] = []
         # > update needs to loop over all histograms, not just the ones that were updated
-        for obs in self.config["run"]["histograms"]:
-            # print(f" post-processing observable {obs} ...")
-            file_out: Path = mrg_path / f"{obs}.dat"
-            if not file_out.exists():
-                continue  # can happen when new histo added to `template.run`
-            hist_info = self.config["run"]["histograms"][obs]
-            nx: int = hist_info["nx"]
-
-            # > register cross section numbers
+        for obs, hist_info in self.config["run"]["histograms"].items():
             if "cumulant" in hist_info:
                 continue  # @todo ?
-
-            res, err = 0.0, 0.0  # accumulate bins to "cross" (possible fac, selectors, ...)
-            bins: list[tuple[float, float]] = []  # (value, error) per in-range bin
-            if nx == 0:
-                with open(file_out) as cross:
-                    for line in cross:
-                        if line.startswith("#"):
-                            continue
-                        col: list[float] = [float(c) for c in line.split()]
-                        res = col[0]
-                        err = col[1] ** 2
-                        break
-            elif nx == 3:
-                with open(file_out) as diff:
-                    for line in diff:
-                        if line.startswith("#overflow"):
-                            scol: list[str] = line.split()
-                            res += float(scol[3])
-                            err += float(scol[4]) ** 2
-                        if line.startswith("#"):
-                            continue
-                        col: list[float] = [float(c) for c in line.split()]
-                        res += (col[2] - col[0]) * col[3]
-                        # > this is formally not the correct way to compute the error
-                        # > but serves as a conservative error for optimizing on histograms
-                        err += ((col[2] - col[0]) * col[4]) ** 2
-                        bins.append((col[3], col[4]))
-            else:
-                raise ValueError(self._logger_prefix + f"::run:  unexpected nx = {nx}")
-            err = math.sqrt(err)
-
+            try:
+                fig = read_obs_figure(mrg_path / f"{obs}.dat", obs, hist_info["nx"])
+            except ValueError as exc:
+                raise ValueError(self._logger_prefix + f"::run:  {exc}") from exc
+            if fig is None:
+                continue  # can happen when new histo added to `template.run`
             if obs == "cross":
-                cross_result = res
-                cross_error = err
-
-            figures.append(ObsFigure(obs, res, err, tuple(bins)))
+                cross_result, cross_error = fig.result, fig.error
+            figures.append(fig)
 
         # > update the error from the chosen optimization target
         opt_target: str = self.config["run"]["opt_target"]
