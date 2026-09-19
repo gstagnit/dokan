@@ -798,8 +798,15 @@ def print_status(config, run_tag: float, *, n_log: int = 20, console: Console | 
         console.print(f"[dim][{dt_str}][/dim]({LogLevel(log.level)!r}): {log.message}")
 
 
+def tick_stamp(when: float | None = None) -> str:
+    """The `YYYY-MM-DD HH:MM:SS` prefix of every line `tick` prints on stdout: those
+    lines are appended to a log file by a scheduler, which keeps no time of its own."""
+    stamp = datetime.datetime.fromtimestamp(when if when is not None else time.time())
+    return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def format_report(report: TickReport) -> str:
-    """One line a scheduler's mail or a log file can hold."""
+    """One line a scheduler's mail or a log file can hold, stamped with the date and time."""
     parts: list[str] = [f"phase={report.phase}"]
     if report.n_batches:
         parts.append(f"batches={report.n_batches}")
@@ -828,4 +835,5 @@ def format_report(report: TickReport) -> str:
         parts.append(f"dispatched={report.n_dispatched}")
     if report.settled:
         parts.append("settled")
-    return "tick: " + "  ".join(parts) + ("  |  " + "; ".join(report.messages) if report.messages else "")
+    messages: str = "  |  " + "; ".join(report.messages) if report.messages else ""
+    return f"{tick_stamp()}  tick: " + "  ".join(parts) + messages

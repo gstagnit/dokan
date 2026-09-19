@@ -52,7 +52,7 @@ from .preproduction import (
 )
 from .runcard import Runcard, RuncardTemplate
 from .scheduler import WorkerSchedulerFactory
-from .tick import Tick, TickLease, campaign_tag, format_report, print_status
+from .tick import Tick, TickLease, campaign_tag, format_report, print_status, tick_stamp
 from .util import format_cpu_time, parse_time_interval
 
 # > Luigi's console verbosity (its own scale, not dokan's `ui.log_level`): the live
@@ -581,7 +581,7 @@ def main() -> None:
 
         lease = TickLease(run_path / "tick.lease", args.lease_timeout)
         if (reason := lease.acquire()) is not None:
-            console.print(f"tick: skipped ({reason})")
+            console.print(f"{tick_stamp()}  tick: skipped ({reason})", highlight=False)
             sys.exit(0)
         tick = Tick(config=config, run_tag=run_tag)
         with tick.session as session:
@@ -599,7 +599,7 @@ def main() -> None:
             # > a pre-flight failure: say why on stdout (a scheduler's mail) and in the log
             with tick.session as session:
                 tick._logger(session, f"Tick::run:  aborted: {exc}", level=LogLevel.ERROR)
-            sys.exit(f"tick: aborted: {exc}")
+            sys.exit(f"{tick_stamp()}  tick: aborted: {exc}")
         finally:
             lease.release()
         if not args.quiet:
