@@ -688,21 +688,39 @@ def main() -> None:
             shutil.rmtree(tmp_path)
         tmp_path.mkdir(parents=True)
         tmp_run: Path = tmp_path / "job.run"
-        run_template.fill(
-            tmp_run,
-            sweep="warmup = 1[1]  production = 1[1]",
-            run="",
-            channels="LO",
-            channels_region="",
-            toplevel="",
-        )
-        dry_exe: dict = dry_run(config["exe"]["path"], tmp_path, tmp_run)
+        # > a handful of phase-space points can all be rejected by the selection cuts,
+        # > which leaves NNLOJET with nothing to integrate. keep doubling the statistics
+        # > until the run succeeds instead of condemning the runcard on a single point.
+        dry_ncalls: tuple[int, ...] = tuple(2**i for i in range(11))  # > 1, 2, 4, ..., 1024
+        dry_exe: dict = {"success": False}
+        for i_dry, dry_ncall in enumerate(dry_ncalls):
+            run_template.fill(
+                tmp_run,
+                sweep=f"warmup = {dry_ncall}[1]  production = {dry_ncall}[1]",
+                run="",
+                channels="LO",
+                channels_region="",
+                toplevel="",
+            )
+            dry_exe = dry_run(config["exe"]["path"], tmp_path, tmp_run)
+            if dry_exe["success"]:
+                break
+            if i_dry + 1 < len(dry_ncalls):
+                console.print(
+                    f"[dim]dry run with {dry_ncall} event(s) failed, "
+                    f"retrying with {dry_ncalls[i_dry + 1]}...[/dim]"
+                )
         if not dry_exe["success"]:
-            console.print(f"error in dry run at {tmp_path}")
+            console.print(f"error in dry run at {tmp_path} (up to {dry_ncalls[-1]} events)")
             if Confirm.ask("see output?"):
                 with open(dry_exe["file_out"]) as of:
                     syntx = Syntax(of.read(), "text", word_wrap=True)
                     console.print(syntx)
+                # > NNLOJET reports crashes & integrator errors on stderr
+                err_msg: str = Path(dry_exe["file_err"]).read_text().strip()
+                if err_msg:
+                    console.print(f"[bold]stderr[/bold] ({dry_exe['file_err']}):")
+                    console.print(Syntax(err_msg, "text", word_wrap=True))
             sys.exit("invalid input runcard?!")
         # else:
         #     shutil.rmtree(tmp_path)
