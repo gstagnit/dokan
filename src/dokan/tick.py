@@ -147,6 +147,26 @@ class TickLease:
         self.release()
 
 
+def tick_batch_size(config, nactive_part: int, want: int | None = None) -> int:
+    """The batch size a tick derives (`want` is the `--jobs-batch-size` override).
+
+    Never persisted, so whatever reads it outside a tick -- the `STK` marker of the
+    status board counts failures against it (see `DBTask._stuck_parts`) -- derives it too.
+    """
+    run: dict = config["run"]
+    jobs_max: int = (
+        min(run["jobs_max_concurrent"], run["jobs_max_total"])
+        if run["jobs_max_total"] > 0
+        else run["jobs_max_concurrent"]
+    )
+    if want is None or want <= 0:
+        want = 2 * (jobs_max // max(1, nactive_part)) + 1
+    size: int = min(max(want, run["jobs_batch_unit_size"]), jobs_max)
+    if config["exe"]["policy"] == ExecutionPolicy.SLURM:
+        size = min(size, 1000)
+    return size
+
+
 def campaign_tag(run_path: Path) -> tuple[float, bool]:
     """The campaign's `run_tag`, created on first use: `(tag, created_now)`.
 
@@ -767,6 +787,9 @@ class Tick(DBTask):
 def print_status(config, run_tag: float, *, n_log: int = 20, console: Console | None = None) -> None:
     """The live monitor's board and log tail, rendered once from the database."""
     console = console or _console
+    with Monitor(config=config, run_tag=run_tag).session as session:
+        nactive_part: int = session.scalar(select(func.count(Part.id)).where(Part.active.is_(True))) or 0
+    config["run"]["jobs_batch_size"] = tick_batch_size(config, nactive_part)
     monitor = Monitor(config=config, run_tag=run_tag)
     with monitor.session as session:
         monitor._init_board(session)

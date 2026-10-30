@@ -11,11 +11,12 @@ The task can operate in two modes via `id`:
 
 import math
 import time
+from collections.abc import Collection
 
 import luigi
 
 # from rich.console import Console
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from dokan.db._loglevel import LogLevel
@@ -100,16 +101,56 @@ class DBDispatch(DBTask):
         of "done" cannot drift apart — a divergence that previously let `Entry`
         busy-loop re-yielding a non-progressing dispatcher.
         """
-        signal_present = (
-            session.scalars(select(Log).where(Log.level == LogLevel.SIG_DISPATCH_DONE)).first() is not None
-        )
-        if not signal_present:
+        if not self._dispatch_stopped(session):
             return False
         active_remaining = (
             session.scalars(self.select_job.where(Job.status.in_(JobStatus.active_list()))).first()
             is not None
         )
         return not active_remaining
+
+    def _dispatch_stopped(self, session: Session) -> bool:
+        """`SIG_DISPATCH_DONE` was written: no new production jobs will be created."""
+        return session.scalars(select(Log).where(Log.level == LogLevel.SIG_DISPATCH_DONE)).first() is not None
+
+    def _discard_queued(self, session: Session, part_ids: Collection[int] | None = None) -> int:
+        """Delete this submission's QUEUED production jobs (of `part_ids` only, if given)."""
+        stmt = delete(Job).where(
+            Job.run_tag == self.run_tag,
+            Job.mode == ExecutionMode.PRODUCTION,
+            Job.status == JobStatus.QUEUED,
+        )
+        if part_ids is not None:
+            stmt = stmt.where(Job.part_id.in_(part_ids))
+        ndel: int = session.execute(stmt).rowcount  # type: ignore[attr-defined]
+        self._safe_commit(session)
+        return ndel
+
+    def _apply_health(self, session: Session, stuck: dict[int, str], stalled: bool) -> bool:
+        """Stop dispatch if production stalled, else drop the queued jobs of stuck parts.
+
+        `stuck` and `stalled` come from `_stuck_parts`.  Returns True if dispatch was stopped.
+        """
+        if stalled:
+            for message in stuck.values():
+                self._logger(session, self._logger_prefix + f"::repopulate:  {message}", level=LogLevel.ERROR)
+            self._discard_queued(session)
+            self._logger(
+                session,
+                self._logger_prefix + "::repopulate:  production cannot reach the target accuracy",
+                level=LogLevel.SIG_DISPATCH_DONE,
+            )
+            return True
+        # > one part at a time to say which part lost how many jobs; a part's queue is
+        # > emptied once, so this reports each newly stuck part once rather than every pass
+        for part_id, message in stuck.items():
+            if ndel := self._discard_queued(session, [part_id]):
+                self._logger(
+                    session,
+                    self._logger_prefix + f"::repopulate:  {message} [dim](discarded {ndel} queued)[/dim]",
+                    level=LogLevel.WARN,
+                )
+        return False
 
     def complete(self) -> bool:
         """Return True when dispatch is fully settled.
@@ -190,7 +231,9 @@ class DBDispatch(DBTask):
         - Sets `self.part_id` to the part selected for the next dispatch batch,
           or ``0`` when no part is ready (throttled or terminal).
         - May delete QUEUED jobs and write a `SIG_DISPATCH_DONE` log entry when
-          budget is exhausted or the target accuracy has been reached.
+          budget is exhausted, the target accuracy has been reached, or
+          production stalled (see `DBTask._stuck_parts`).
+        - Deletes the QUEUED jobs of stuck parts.
         """
         queue_full: bool = False
 
@@ -221,6 +264,16 @@ class DBDispatch(DBTask):
             if denominator == 0.0:
                 return 0.0 if numerator == 0.0 else float("inf")
             return abs(numerator / denominator)
+
+        self.part_id = 0
+        # > stopped (budget, accuracy, stall): nothing is queued and nothing new will be
+        # > (re-entering the loop would only write the stop signal again)
+        if self._dispatch_stopped(session):
+            return False
+
+        # > drop the queues of stuck parts before any queued job gets selected
+        if self._apply_health(session, *self._stuck_parts(session)):
+            return False
 
         # > get the remaining resources but need to go into the loop
         # > to get the correct state of self.part_id
@@ -403,6 +456,9 @@ class DBDispatch(DBTask):
                 + f"njobs_rem={njobs_rem}, T_rem={T_rem}, T_next={T_next}",
             )
             opt_dist: dict = self._distribute_time(session, T_next)
+            # > jobs may have failed since the check above: never queue on a stale verdict
+            if self._apply_health(session, opt_dist["stuck"], opt_dist["stalled"]):
+                return False
 
             # > interrupt when target accuracy reached (`tot_error` is on the optimisation
             # > target: the cross section, or the worst merged bin/integral for `hist`)
@@ -466,8 +522,8 @@ class DBDispatch(DBTask):
             # > register (at least one) job(s)
             tot_T: float = 0.0
             for part_id, opt in sorted(opt_dist["part"].items(), key=lambda x: x[1]["T_opt"], reverse=True):
-                if tot_njobs == 0:
-                    # > at least one job: pick largest T_opt one
+                if tot_njobs == 0 and part_id not in opt_dist["stuck"]:
+                    # > at least one job: pick largest T_opt one that can take it
                     opt["njobs"] = 1
                     tot_njobs = 1  # trigger only 1st iteration
                 # > make sure we don't exceed the batch size (want *continuous* optimization)
@@ -485,6 +541,15 @@ class DBDispatch(DBTask):
                     + f"register [bold]{len(ids)}[/bold] jobs for {pt.name} [dim](job_ids = {ids})[/dim]",
                 )
                 tot_T += opt["njobs"] * opt["T_job"]
+
+            if tot_njobs == 0:
+                # > no part can take a job (the ones with a runtime estimate are stuck, the
+                # > others wait for theirs to come back): dispatch a queued remainder if
+                # > there is one, otherwise wait -- looping on would not change the verdict
+                if drain_part_id > 0:
+                    self.part_id = drain_part_id
+                    break
+                return True
 
             # > commit & update remaining resources for next iteration
             self._safe_commit(session)

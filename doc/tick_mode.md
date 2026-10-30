@@ -255,7 +255,16 @@ startup pass.
 
 A tick evaluates the accuracy target and the budget exactly as the live loop
 does -- it *is* the live loop's `_repopulate` -- and writes the dispatch-done
-signal when either is met.  Once no active job remains, the tick runs
+signal when either is met -- or when production has stalled.  A part is *stuck*
+when `jobs_batch_size` of its production jobs failed in a row since its last
+success, or when its smallest possible job (one call per iteration) is estimated
+to exceed `job_max_runtime`; it then gets no further jobs and shows as `STK` on
+the board (`status`).  Production has stalled when every part is stuck, or a
+stuck part has no result yet (the total can then never reach a finite error).
+The failures are counted per `run_tag`, and a tick campaign keeps one `run_tag`
+throughout, so `--reopen` alone does not forgive them: raising `job_max_runtime`
+clears the second cause, the first needs a successful job or a new `run_tag`
+(remove `tick.json`).  Once no active job remains, the tick runs
 `MergeFinal`: the forced merge of what is done plus the per-order files and the
 completion signal, as `Entry` stage 4 does.  Later ticks then do nothing.  The
 from-scratch re-merge with the k-scan and the grids stays the explicit

@@ -6,11 +6,12 @@ import traceback
 from abc import ABCMeta, abstractmethod
 from enum import Enum
 from functools import partial
+from itertools import groupby
 from pathlib import Path
 
 import luigi
 from rich.console import Console
-from sqlalchemy import Engine, create_engine, event, func, select
+from sqlalchemy import Engine, and_, create_engine, event, func, or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session  # , scoped_session, sessionmaker
 
@@ -532,6 +533,89 @@ class DBTask(Task, metaclass=ABCMeta):
         njobs_sub, t_sub, t_all = self.budget_used(session)
         return n_cap - njobs_sub, t_cap - (t_all if t_explicit else t_sub)
 
+    def _stuck_parts(self, session: Session) -> tuple[dict[int, str], bool]:
+        """Active parts that cannot take another production job, and whether production stalled.
+
+        A part is stuck when either
+        * `jobs_batch_size` production jobs of this submission failed in a row
+          since its latest successful job (by job id), or
+        * the smallest job dokan can submit -- one call per iteration -- is
+          estimated to take longer than `job_max_runtime`.
+        Without this, such a part is re-queued until the budget runs out.
+
+        Production has *stalled* when every active part is stuck, or when a stuck
+        part has no result yet: the total then never reaches a finite error, so
+        the target accuracy is out of reach whatever the others do.
+
+        Returns `({part_id: reason}, stalled)`.
+        """
+        run: dict = self.config["run"]
+        max_failures: int = run["jobs_batch_size"]
+        niter: int = self.config["production"]["niter"]
+        rows = session.execute(
+            select(
+                Part.id,
+                Part.name,
+                Part.error,
+                Job.status,
+                Job.ncall,
+                Job.niter,
+                Job.elapsed_time,
+            )
+            .outerjoin(
+                Job,
+                and_(
+                    Job.part_id == Part.id,
+                    Job.mode == ExecutionMode.PRODUCTION,
+                    Job.policy == self.config["exe"]["policy"],
+                    or_(
+                        Job.status.in_(JobStatus.success_list()),
+                        and_(Job.status == JobStatus.FAILED, Job.run_tag == self.run_tag),
+                    ),
+                ),
+            )
+            .where(Part.active.is_(True))
+            .order_by(Part.id, Job.id)
+        ).all()
+
+        stuck: dict[int, str] = {}
+        no_result: bool = False
+        nparts: int = 0
+        for part_id, group in groupby(rows, key=lambda row: row.id):
+            nparts += 1
+            group = list(group)
+            # > same runtime estimate as `_distribute_time`: a plain mean over usable successful jobs
+            taus: list[float] = []
+            nfailed: int = 0
+            for row in group:
+                if row.status is None:  # > part without any matching job
+                    continue
+                if row.status == JobStatus.FAILED:
+                    nfailed += 1
+                    continue
+                ntot: int = row.ncall * row.niter
+                if ntot > 0 and row.elapsed_time > 0.0:
+                    taus.append(row.elapsed_time / ntot)
+                    nfailed = 0
+            tau: float = sum(taus) / len(taus) if taus else 0.0
+            if nfailed >= max_failures:
+                reason = (
+                    f"{nfailed} production jobs failed in a row (limit: jobs_batch_size = {max_failures})"
+                )
+            elif tau * niter > run["job_max_runtime"]:
+                reason = (
+                    f"the smallest job ({niter} events) is estimated to take {tau * niter:g}s,"
+                    f" more than job_max_runtime = {run['job_max_runtime']:g}s; raise it to continue"
+                )
+            else:
+                continue
+            if not math.isfinite(group[0].error):
+                no_result = True
+                reason += "; it has no result yet, so the target accuracy is out of reach"
+            stuck[part_id] = f"part {part_id} ({group[0].name!r}) gets no further jobs: {reason}"
+
+        return stuck, bool(stuck) and (no_result or len(stuck) == nparts)
+
     # @todo make return a UserDict class with a schema?
     def _distribute_time(self, session: Session, total_t: float) -> dict:
         from sqlalchemy.orm import joinedload
@@ -548,6 +632,9 @@ class DBTask(Task, metaclass=ABCMeta):
             .where(Job.mode == ExecutionMode.PRODUCTION)
             .where(Job.policy == self.config["exe"]["policy"])
         )
+        # > stuck parts keep entering the totals but receive no new runtime
+        stuck, stalled = self._stuck_parts(session)
+
         # > PreProduction guarantees there's a production job for any new policy
         for job in session.scalars(select_job):
             if job.part_id not in cache:
@@ -706,6 +793,8 @@ class DBTask(Task, metaclass=ABCMeta):
         result = {
             "part": {},  # part_id -> {tau, tau_err, T_opt, T_max_job, T_job, njobs, ntot_job}
             "target": objective.label if objective is not None else self.config["run"]["opt_target"],
+            "stuck": stuck,  # part_id -> reason (see `_stuck_parts`)
+            "stalled": stalled,
             "tot_result": 0.0,
             "tot_error": 0.0,
             "tot_error_estimate_opt": 0.0,
@@ -742,6 +831,8 @@ class DBTask(Task, metaclass=ABCMeta):
                         "i_T": i_t,
                         "i_err_sqrtT": ic["adj_error"] * math.sqrt(i_t),
                     }
+                    if part_id in stuck:
+                        result["part"][part_id]["T_opt"] = 0.0  # > excluded from the start
                 # > sums over *every* part, excluded ones included.  The E-L sums below
                 # > drop the excluded parts -- correct for *allocating* a given budget,
                 # > but not for the `T_target` bracket at the end of this method, which
@@ -904,8 +995,6 @@ class DBTask(Task, metaclass=ABCMeta):
             ncall: int = max(1, -(-ntot_job // niter))
             ncall = min(ncall, max(1, int(self.config["run"]["job_max_runtime"] / (ires["tau"] * niter))))
             ntot_job = ncall * niter
-
-
 
             # > if we inflated the error of a count==1 part, we only want to register *one* job
             if (

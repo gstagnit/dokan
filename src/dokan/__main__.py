@@ -52,7 +52,15 @@ from .preproduction import (
 )
 from .runcard import Runcard, RuncardTemplate
 from .scheduler import WorkerSchedulerFactory
-from .tick import Tick, TickLease, campaign_tag, format_report, print_status, tick_stamp
+from .tick import (
+    Tick,
+    TickLease,
+    campaign_tag,
+    format_report,
+    print_status,
+    tick_batch_size,
+    tick_stamp,
+)
 from .util import format_cpu_time, parse_time_interval
 
 # > Luigi's console verbosity (its own scale, not dokan's `ui.log_level`): the live
@@ -561,21 +569,7 @@ def main() -> None:
                 sys.exit("calculation has no active part?!")
 
         # > batch size, derived as in `submit`
-        jobs_max = (
-            min(config["run"]["jobs_max_concurrent"], n_cap_cfg)
-            if n_cap_cfg > 0
-            else config["run"]["jobs_max_concurrent"]
-        )
-        batch_size_want = (
-            args.jobs_batch_size
-            if args.jobs_batch_size is not None and args.jobs_batch_size > 0
-            else 2 * (jobs_max // nactive_part) + 1
-        )
-        config["run"]["jobs_batch_size"] = min(
-            max(batch_size_want, config["run"]["jobs_batch_unit_size"]), jobs_max
-        )
-        if config["exe"]["policy"] == ExecutionPolicy.SLURM:
-            config["run"]["jobs_batch_size"] = min(config["run"]["jobs_batch_size"], 1000)
+        config["run"]["jobs_batch_size"] = tick_batch_size(config, nactive_part, args.jobs_batch_size)
 
         setup_luigi_logging(run_path / "luigi.log", _LUIGI_CONSOLE_LEVEL)
 

@@ -37,6 +37,10 @@ _LOG_HISTORY: int = 500
 # > width plus this, the split is dropped and messages go above the board as before.
 _LOG_MIN_WIDTH: int = 60
 
+# > The stuck-part check scans the production job history: refresh it less often
+# > than the counters (seconds).
+_STUCK_REFRESH_INTERVAL: float = 30.0
+
 
 def _part_label(pt: Part) -> str:
     """Column label of a part: name plus region suffix (e.g. "RRa")."""
@@ -69,6 +73,8 @@ class Monitor(DBTask):
         """Initialize static monitor state (no DB access at construction time)."""
         super().__init__(*args, **kwargs)
         self._refresh_delay = self.config["ui"].get("refresh_delay", 1.5)
+        self._next_stuck_refresh: float = 0.0
+        self._stuck_part_ids: set[int] = set()
         self._log_id: int = 0
         self.cross_line: str = "[blue]cross = ... (waiting for first update) [/blue]"
         self.cross_time: float = time.time()
@@ -125,7 +131,7 @@ class Monitor(DBTask):
             )
         return counts
 
-    def job_summary(self, part_counts: list[_JobCount]) -> str:
+    def job_summary(self, part_counts: list[_JobCount], stuck: bool = False) -> str:
         """Build one compact status string for a single active part from its counts."""
         display_mode: ExecutionMode = (
             ExecutionMode.WARMUP
@@ -149,6 +155,8 @@ class Monitor(DBTask):
             if c.status == JobStatus.RUNNING and c.current:
                 n_running_current += c.n
         result: str = "[blue]WRM[/blue]" if display_mode == ExecutionMode.WARMUP else "[magenta]PRD[/magenta]"
+        if stuck:
+            result = "[red]STK[/red]"
         result = f"[bold]{result}[/bold]" if n_running_current > 0 else f"[dim]{result}[/dim]"
         result += f" [yellow]A[dim][{n_running_current}/{n_active}][/dim][/yellow]"
         result += f" [green]D[dim][{n_success}][/dim][/green]"
@@ -160,8 +168,13 @@ class Monitor(DBTask):
         """Generate the current table snapshot from DB state."""
         # > one aggregate query for all parts; cell positions are static from `_init_board`
         counts = self._collect_job_counts(session)
+        if time.monotonic() >= self._next_stuck_refresh:
+            self._stuck_part_ids = set(self._stuck_parts(session)[0])
+            self._next_stuck_refresh = time.monotonic() + _STUCK_REFRESH_INTERVAL
         for part_id, (irow, icol) in self._cells.items():
-            self._data[irow][icol] = self.job_summary(counts.get(part_id, []))
+            self._data[irow][icol] = self.job_summary(
+                counts.get(part_id, []), stuck=part_id in self._stuck_part_ids
+            )
 
         # > create the table structure
         dt_str: str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -186,7 +199,8 @@ class Monitor(DBTask):
             title=f"[{dt_str}]\n{self.cross_line}\n"
             + f"(updated {datetime.timedelta(seconds=int(time.time() - self.cross_time))!s} ago)\n"
             + "[dim]legend:[/dim]"
-            + " [yellow][b]A[/b]ctive[/yellow] [green][b]D[/b]one[/green] [red][b]F[/b]ailed[/red]",
+            + " [yellow][b]A[/b]ctive[/yellow] [green][b]D[/b]one[/green] [red][b]F[/b]ailed[/red]"
+            + " [red]STK[/red] stuck",
             title_justify="left",
             title_style=Style(bold=False, italic=False),
         )

@@ -1,18 +1,21 @@
-"""How production jobs are sized.
+"""Parts that cannot take another production job, and how production jobs are sized.
 
 Run with the dokan environment's interpreter, e.g.
     PYTHONPATH=src python -m pytest tests/test_production_dispatch.py
 """
 
+import math
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from dokan.config import Config
 from dokan.db._dbdispatch import DBDispatch
 from dokan.db._dbtask import _DBRole
 from dokan.db._jobstatus import JobStatus
-from dokan.db._sqla import DokanDB, DokanLog, Job, Part
+from dokan.db._loglevel import LogLevel
+from dokan.db._sqla import DokanDB, DokanLog, Job, Log, Part
 from dokan.exe import ExecutionMode
 
 RUN_TAG: float = 2.0
@@ -91,6 +94,72 @@ def _jobs(
         session.commit()
 
 
+def _stuck(task: DBDispatch) -> tuple[dict[int, str], bool]:
+    with task.session as session:
+        return task._stuck_parts(session)
+
+
+def test_a_part_with_successes_is_not_stuck(dispatch):
+    pid = _part(dispatch, "V_1")
+    _jobs(dispatch, pid, JobStatus.MERGED)
+    _jobs(dispatch, pid, JobStatus.FAILED, 2)  # > below the limit of 3
+    assert _stuck(dispatch) == ({}, False)
+
+
+def test_consecutive_failures_of_this_submission_make_a_part_stuck(dispatch):
+    pid = _part(dispatch, "V_1")
+    _jobs(dispatch, pid, JobStatus.FAILED, 5, run_tag=OLD_TAG)  # > an earlier submission: forgotten
+    _jobs(dispatch, pid, JobStatus.MERGED, run_tag=OLD_TAG)
+    _jobs(dispatch, pid, JobStatus.FAILED, 3)
+    stuck, stalled = _stuck(dispatch)
+    assert list(stuck) == [pid] and "3 production jobs failed in a row" in stuck[pid]
+    assert stalled  # > the only part
+
+
+def test_a_success_resets_the_failure_count(dispatch):
+    pid = _part(dispatch, "V_1")
+    _jobs(dispatch, pid, JobStatus.FAILED, 3)
+    _jobs(dispatch, pid, JobStatus.DONE)
+    _jobs(dispatch, pid, JobStatus.FAILED, 2)
+    assert _stuck(dispatch) == ({}, False)
+
+
+def test_a_minimum_job_beyond_the_runtime_limit_makes_a_part_stuck(dispatch):
+    pid = _part(dispatch, "V_1")
+    _jobs(dispatch, pid, JobStatus.MERGED, ncall=1, elapsed=300.0)  # > 150s per event, 2 events per job
+    stuck, _ = _stuck(dispatch)
+    assert "job_max_runtime" in stuck[pid]
+
+
+def test_stalled_only_when_no_part_can_progress_or_the_total_has_no_error(dispatch):
+    ok = _part(dispatch, "V_1")
+    bad = _part(dispatch, "V_2")
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.FAILED, 3)
+    stuck, stalled = _stuck(dispatch)
+    assert set(stuck) == {bad} and not stalled
+
+    no_result = _part(dispatch, "V_3", error=math.inf)
+    _jobs(dispatch, no_result, JobStatus.FAILED, 3)
+    stuck, stalled = _stuck(dispatch)
+    assert set(stuck) == {bad, no_result} and stalled
+    assert "no result yet" in stuck[no_result]
+
+
+def test_a_stuck_part_gets_no_runtime(dispatch):
+    ok = _part(dispatch, "V_1")
+    bad = _part(dispatch, "V_2", error=10.0)  # > would otherwise get most of the runtime
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.FAILED, 3)
+    with dispatch.session as session:
+        opt = dispatch._distribute_time(session, 1000.0)
+    assert set(opt["stuck"]) == {bad} and not opt["stalled"]
+    assert opt["part"][bad]["T_opt"] == 0.0 and opt["part"][bad]["njobs"] == 0
+    assert opt["part"][ok]["T_opt"] == pytest.approx(1000.0)
+
+
 def test_jobs_are_whole_iterations_within_the_runtime_limit(dispatch):
     pid = _part(dispatch, "V_1")
     _jobs(dispatch, pid, JobStatus.MERGED, 2)  # > tau = 1s exactly, no spread: 50% buffer
@@ -110,3 +179,35 @@ def test_a_part_without_new_runtime_is_sized_for_a_start_job(dispatch):
     with dispatch.session as session:
         opt = dispatch._distribute_time(session, 1.0)["part"][pid]
     assert opt["njobs"] == 0 and opt["ncall"] * opt["niter"] == 10  # > ncall_start x niter
+
+
+def test_dispatch_stops_when_production_stalls(dispatch):
+    pid = _part(dispatch, "V_1")
+    _jobs(dispatch, pid, JobStatus.FAILED, 3)
+    _jobs(dispatch, pid, JobStatus.QUEUED, 4)
+    with dispatch.session as session:
+        assert dispatch._repopulate(session) is False
+        assert dispatch.part_id == 0
+        assert not session.scalars(select(Job).where(Job.status == JobStatus.QUEUED)).all()
+        signals = session.scalars(select(Log).where(Log.level == LogLevel.SIG_DISPATCH_DONE)).all()
+        assert len(signals) == 1 and "cannot reach the target accuracy" in signals[0].message
+        # > stopped: a second pass neither queues nor signals again
+        assert dispatch._repopulate(session) is False
+        assert len(session.scalars(select(Log).where(Log.level == LogLevel.SIG_DISPATCH_DONE)).all()) == 1
+
+
+def test_a_stuck_part_loses_its_queue_and_the_others_carry_on(dispatch):
+    ok = _part(dispatch, "V_1")
+    bad = _part(dispatch, "V_2")
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.FAILED, 3)
+    _jobs(dispatch, bad, JobStatus.QUEUED, 4)
+    with dispatch.session as session:
+        dispatch._repopulate(session)
+        queued = session.scalars(select(Job).where(Job.status == JobStatus.QUEUED)).all()
+        assert queued and {job.part_id for job in queued} == {ok}
+        assert dispatch.part_id == ok
+        warnings = session.scalars(select(Log).where(Log.level == LogLevel.WARN)).all()
+        assert any("discarded 4 queued" in log.message for log in warnings)
+        assert not session.scalars(select(Log).where(Log.level == LogLevel.SIG_DISPATCH_DONE)).all()
