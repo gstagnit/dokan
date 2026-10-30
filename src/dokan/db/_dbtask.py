@@ -1113,9 +1113,7 @@ def _on_task_failure(task, exception) -> None:
     _log_failure(
         task,
         f"{_task_label(task)}::FAILURE:  "
-        + "".join(
-            traceback.format_exception(type(exception), exception, exception.__traceback__)
-        ).rstrip(),
+        + "".join(traceback.format_exception(type(exception), exception, exception.__traceback__)).rstrip(),
     )
 
 
@@ -1140,7 +1138,5 @@ def _on_broken_task(task, exception) -> None:
     _log_failure(
         task,
         f"{_task_label(task)}::BROKEN_TASK:  "
-        + "".join(
-            traceback.format_exception(type(exception), exception, exception.__traceback__)
-        ).rstrip(),
+        + "".join(traceback.format_exception(type(exception), exception, exception.__traceback__)).rstrip(),
     )

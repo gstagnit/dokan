@@ -62,7 +62,6 @@ from ._sqla import Job, Log, Part
 _HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
 
 
-
 # > How often `MergePart` may re-yield an unchanged pending set before giving up.  Each
 # > crash mid-merge costs one attempt, so this must exceed 1 for a run to survive being
 # > killed; it stays small because a genuine livelock has to terminate.  `submit` clears

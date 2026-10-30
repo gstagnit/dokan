@@ -455,8 +455,7 @@ def build_obs_group(
                             if parsed_nx is not None:
                                 if parsed_nx != nx:
                                     raise ValueError(
-                                        f"nx mismatch in {base_path / obs_files[obs][0]}: "
-                                        f"{parsed_nx} != {nx}"
+                                        f"nx mismatch in {base_path / obs_files[obs][0]}: {parsed_nx} != {nx}"
                                     )
                             elif line.startswith("#overflow"):
                                 nrows += 1
@@ -492,9 +491,7 @@ def build_obs_group(
                     compression="lzf",  # faster (de-)compression, only for h5py
                 )
                 if nx > 0:
-                    h5dat_xval = h5grp_obs.create_dataset(
-                        "xval", (nrows, nx), dtype=np.float64, data=xval
-                    )
+                    h5dat_xval = h5grp_obs.create_dataset("xval", (nrows, nx), dtype=np.float64, data=xval)
                     h5dat_xval.make_scale("x value")
                     h5dat_data.dims[0].attach_scale(h5dat_xval)
 
@@ -555,9 +552,7 @@ def build_obs_group(
                                 buf_neval[i] = int(line.split()[-1])
                             elif line.startswith("#overflow"):
                                 # > overflow rows are rare: parse individually
-                                arr_f64 = np.fromstring(
-                                    line.split(None, nx)[nx], dtype=np.float64, sep=" "
-                                )
+                                arr_f64 = np.fromstring(line.split(None, nx)[nx], dtype=np.float64, sep=" ")
                                 assert len(arr_f64) == 2 * ncols
                                 buf_data["result"][i, irow, :] = arr_f64[0::2]
                                 buf_data["error2"][i, irow, :] = arr_f64[1::2] ** 2
@@ -610,8 +605,7 @@ def build_obs_group(
             # > all stored files (old + new).  Never use wall-clock here — coarse-grained
             # > filesystem mtimes can make a freshly-written .dat look stale on fast resumes.
             h5grp_obs.attrs["timestamp"] = max(
-                (base_path / file_path).stat().st_mtime
-                for file_path in set(in_files_old) | set(in_files_cur)
+                (base_path / file_path).stat().st_mtime for file_path in set(in_files_old) | set(in_files_cur)
             )
 
     return resize_obs
@@ -943,8 +937,16 @@ class MergeObs(Task):
             # > spurious outlier contributes almost nothing to it; one that carries the
             # > integral is the physics, and removing it would not clean the sample but
             # > change the answer.
-            diag = {"bins": 0, "bins_flagged": 0, "slots": 0, "n_cand": 0, "n_trimmed": 0,
-                    "cap_hit": 0, "max_share": 0.0, "bins_no_plateau": 0}
+            diag = {
+                "bins": 0,
+                "bins_flagged": 0,
+                "slots": 0,
+                "n_cand": 0,
+                "n_trimmed": 0,
+                "cap_hit": 0,
+                "max_share": 0.0,
+                "bins_no_plateau": 0,
+            }
 
             for irow in range(nrows):
                 for icol in range(ncols):

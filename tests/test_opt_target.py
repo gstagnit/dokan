@@ -115,10 +115,18 @@ def campaign(tmp_path: Path) -> Path:
     # > two parts: a big well-determined one (LO-like) and a small noisy one (R-like).  The
     # > projector histogram `ptz_A1` is small (~1% of ptz) and its error is dominated by the
     # > small part in every bin.
-    _write_part(tmp_path, "LO_1", (1000.0, 1.0),
-                {"ptz": [(600.0, 0.6), (400.0, 0.4)], "ptz_A1": [(6.0, 0.02), (4.0, 0.02)]})
-    _write_part(tmp_path, "R_1", (-100.0, 5.0),
-                {"ptz": [(-60.0, 3.0), (-40.0, 4.0)], "ptz_A1": [(-0.5, 0.5), (-0.8, 0.3)]})
+    _write_part(
+        tmp_path,
+        "LO_1",
+        (1000.0, 1.0),
+        {"ptz": [(600.0, 0.6), (400.0, 0.4)], "ptz_A1": [(6.0, 0.02), (4.0, 0.02)]},
+    )
+    _write_part(
+        tmp_path,
+        "R_1",
+        (-100.0, 5.0),
+        {"ptz": [(-60.0, 3.0), (-40.0, 4.0)], "ptz_A1": [(-0.5, 0.5), (-0.8, 0.3)]},
+    )
     return tmp_path
 
 

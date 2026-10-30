@@ -102,9 +102,7 @@ class DBResurrect(DBTask):
         job_ids: list[int] = list(self._recover_jobs or self.exe_data["jobs"])
         with self.session as session:
             self._debug(session, f"{self._logger_prefix}::complete: {self.rel_path}")
-            status_rows = session.execute(
-                select(Job.id, Job.status).where(Job.id.in_(job_ids))
-            ).all()
+            status_rows = session.execute(select(Job.id, Job.status).where(Job.id.in_(job_ids))).all()
             status_by_id: dict[int, int] = {job_id: status for job_id, status in status_rows}
             for job_id in job_ids:
                 status = status_by_id.get(job_id)
