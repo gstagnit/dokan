@@ -547,10 +547,15 @@ class DBTask(Task, metaclass=ABCMeta):
         part has no result yet: the total then never reaches a finite error, so
         the target accuracy is out of reach whatever the others do.
 
+        Failures of jobs below `run.failures_from_job` are forgiven: a tick campaign
+        keeps one `run_tag` throughout, and `tick --reopen` moves that mark past
+        every job that exists, so a part stopped by failures gets another chance.
+
         Returns `({part_id: reason}, stalled)`.
         """
         run: dict = self.config["run"]
         max_failures: int = run["jobs_batch_size"]
+        failures_from_job: int = run.get("failures_from_job") or 0
         niter: int = self.config["production"]["niter"]
         rows = session.execute(
             select(
@@ -570,7 +575,11 @@ class DBTask(Task, metaclass=ABCMeta):
                     Job.policy == self.config["exe"]["policy"],
                     or_(
                         Job.status.in_(JobStatus.success_list()),
-                        and_(Job.status == JobStatus.FAILED, Job.run_tag == self.run_tag),
+                        and_(
+                            Job.status == JobStatus.FAILED,
+                            Job.run_tag == self.run_tag,
+                            Job.id >= failures_from_job,
+                        ),
                     ),
                 ),
             )

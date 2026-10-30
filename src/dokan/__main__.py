@@ -56,6 +56,8 @@ from .tick import (
     Tick,
     TickLease,
     campaign_tag,
+    failures_from_job,
+    forgive_failures,
     format_report,
     print_status,
     tick_batch_size,
@@ -514,6 +516,7 @@ def main() -> None:
                 status_tag = float(json.loads(state.read_text()).get("run_tag") or 0.0)
             except (OSError, ValueError, AttributeError):
                 status_tag = 0.0
+            status_config["run"]["failures_from_job"] = failures_from_job(state.parent)
         print_status(status_config, status_tag, n_log=max(0, args.lines), console=console)
         sys.exit(0)
 
@@ -577,6 +580,16 @@ def main() -> None:
         if (reason := lease.acquire()) is not None:
             console.print(f"{tick_stamp()}  tick: skipped ({reason})", highlight=False)
             sys.exit(0)
+        # > reopening also forgives the production failures so far (a stuck part gets another
+        # > chance): set before the Tick is built, whose configuration every task inherits
+        try:
+            if args.reopen:
+                with db_init.session as session:
+                    forgive_failures(run_path, (session.scalar(select(func.max(Job.id))) or 0) + 1)
+            config["run"]["failures_from_job"] = failures_from_job(run_path)
+        except (OSError, RuntimeError) as exc:
+            lease.release()
+            sys.exit(f"{tick_stamp()}  tick: aborted: {exc}")
         tick = Tick(config=config, run_tag=run_tag)
         with tick.session as session:
             last = session.scalars(select(Log).order_by(Log.id.desc())).first()

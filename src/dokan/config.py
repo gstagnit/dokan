@@ -96,6 +96,10 @@ _schema: dict = {
         # > of tracking, the dispatcher performs one wave and returns instead of
         # > re-yielding itself.  Never persisted.
         "detached": bool,
+        # > tick-time only: production failures of jobs with a lower id do not count
+        # > towards a stuck part (`DBTask._stuck_parts`); `tick --reopen` moves the mark
+        # > past every existing job, `tick.json` keeps it.  Never persisted here.
+        "failures_from_job": int,
     },
     "ui": {
         "monitor": bool,  # flag to switch on/off the live monitor
@@ -284,6 +288,7 @@ _deprecated: list[tuple[str, str]] = [
 _transient: list[tuple[str, str]] = [
     ("warmup", "skip_qc"),  # `submit --no-warmup`
     ("run", "detached"),  # `tick`
+    ("run", "failures_from_job"),  # `tick` (kept in `tick.json`)
 ]
 
 _OPT_TARGETS: tuple[str, ...] = ("cross", "cross_hist", "hist")

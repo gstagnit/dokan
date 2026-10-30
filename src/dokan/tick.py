@@ -167,6 +167,28 @@ def tick_batch_size(config, nactive_part: int, want: int | None = None) -> int:
     return size
 
 
+def failures_from_job(run_path: Path) -> int:
+    """The job id from which production failures count towards a stuck part (0: all)."""
+    state = read_json_sidecar(run_path / _STATE_FILE)
+    mark = state.get("failures_from_job") if isinstance(state, dict) else None
+    return int(mark) if isinstance(mark, int) else 0
+
+
+def forgive_failures(run_path: Path, next_job_id: int) -> None:
+    """Count production failures only from job `next_job_id` on (`tick --reopen`).
+
+    A tick campaign keeps one `run_tag`, so the failures that made a part stuck would
+    otherwise count for as long as the campaign lives: reopening is the user saying
+    the cause has been dealt with.
+    """
+    state_path: Path = run_path / _STATE_FILE
+    state = read_json_sidecar(state_path)
+    if not isinstance(state, dict):
+        raise RuntimeError(f"no campaign state in {state_path}")
+    state["failures_from_job"] = next_job_id
+    write_json_sidecar(state_path, state)
+
+
 def campaign_tag(run_path: Path) -> tuple[float, bool]:
     """The campaign's `run_tag`, created on first use: `(tag, created_now)`.
 
@@ -322,6 +344,8 @@ class Tick(DBTask):
 
         The live `submit` achieves the same by clearing the log at startup; a tick
         never clears the log, so the signals are demoted in place, audit trail kept.
+        The production failures so far are forgiven before this tick's tasks are
+        built (`forgive_failures`, `run.failures_from_job`); this only reports it.
         """
         n: int = 0
         with self.session as session:
@@ -334,6 +358,11 @@ class Tick(DBTask):
             if n:
                 self._safe_commit(session)
                 self._logger(session, f"{self._logger_prefix}::reopen:  demoted {n} terminal signal(s)")
+            self._logger(
+                session,
+                f"{self._logger_prefix}::reopen:  production failures before job"
+                f" {self.config['run'].get('failures_from_job') or 0} no longer count towards a stuck part",
+            )
         return n
 
     # -----------------------------------------------------------------------

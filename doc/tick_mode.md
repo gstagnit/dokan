@@ -261,10 +261,7 @@ success, or when its smallest possible job (one call per iteration) is estimated
 to exceed `job_max_runtime`; it then gets no further jobs and shows as `STK` on
 the board (`status`).  Production has stalled when every part is stuck, or a
 stuck part has no result yet (the total can then never reach a finite error).
-The failures are counted per `run_tag`, and a tick campaign keeps one `run_tag`
-throughout, so `--reopen` alone does not forgive them: raising `job_max_runtime`
-clears the second cause, the first needs a successful job or a new `run_tag`
-(remove `tick.json`).  Once no active job remains, the tick runs
+Once no active job remains, the tick runs
 `MergeFinal`: the forced merge of what is done plus the per-order files and the
 completion signal, as `Entry` stage 4 does.  Later ticks then do nothing.  The
 from-scratch re-merge with the k-scan and the grids stays the explicit
@@ -272,7 +269,12 @@ from-scratch re-merge with the k-scan and the grids stays the explicit
 
 `tick --reopen` demotes the terminal signals so a finished campaign continues
 after the budget was raised or the target lowered in `config.json` (the live
-`submit` achieves the same by clearing the log at startup).  `tick --no-dispatch`
+`submit` achieves the same by clearing the log at startup).  It also forgives the
+production failures so far: a tick campaign keeps one `run_tag` throughout, so
+without that a part stuck on failures would stay stuck for as long as the
+campaign lives.  The mark (`failures_from_job`, the first job id whose failure
+counts) is kept in `tick.json`.  A part stuck on the runtime limit needs
+`job_max_runtime` raised instead.  `tick --no-dispatch`
 only reconciles and merges: a campaign is drained by switching to it.
 
 ### Lease

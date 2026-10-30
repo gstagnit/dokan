@@ -1,6 +1,6 @@
 """`config.json` explains its options with `//` comments that the loader strips."""
 
-from dokan.config import _DOC, Config, _schema, annotate_config_json, read_config_json
+from dokan.config import _DOC, Config, _schema, _transient, annotate_config_json, read_config_json
 
 
 def test_every_option_of_the_schema_is_documented():
@@ -8,7 +8,8 @@ def test_every_option_of_the_schema_is_documented():
         f"{section}.{key}"
         for section, keys in _schema.items()
         for key in keys
-        if key not in _DOC.get(section, {}) and (section, key) != ("warmup", "skip_qc") and key != "detached"
+        # > transient keys are stripped on write: there is no file line to comment
+        if key not in _DOC.get(section, {}) and (section, key) not in _transient
     ]
     assert missing == []
 

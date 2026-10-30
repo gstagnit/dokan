@@ -4,6 +4,7 @@ Run with the dokan environment's interpreter, e.g.
     PYTHONPATH=src python -m pytest tests/test_production_dispatch.py
 """
 
+import json
 import math
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from dokan.db._jobstatus import JobStatus
 from dokan.db._loglevel import LogLevel
 from dokan.db._sqla import DokanDB, DokanLog, Job, Log, Part
 from dokan.exe import ExecutionMode
+from dokan.tick import failures_from_job, forgive_failures
 
 RUN_TAG: float = 2.0
 OLD_TAG: float = 1.0  # > an earlier submission
@@ -211,3 +213,23 @@ def test_a_stuck_part_loses_its_queue_and_the_others_carry_on(dispatch):
         warnings = session.scalars(select(Log).where(Log.level == LogLevel.WARN)).all()
         assert any("discarded 4 queued" in log.message for log in warnings)
         assert not session.scalars(select(Log).where(Log.level == LogLevel.SIG_DISPATCH_DONE)).all()
+
+
+def test_failures_before_the_mark_are_forgiven(tmp_path):
+    task = _make(tmp_path)
+    pid = _part(task, "V_1")
+    _jobs(task, pid, JobStatus.MERGED)
+    _jobs(task, pid, JobStatus.FAILED, 3)  # > job ids 2-4
+    assert list(_stuck(task)[0]) == [pid]
+    reopened = _make(tmp_path, failures_from_job=5)
+    assert _stuck(reopened) == ({}, False)
+    _jobs(reopened, pid, JobStatus.FAILED, 3)  # > after the reopen: these count
+    assert list(_stuck(reopened)[0]) == [pid]
+
+
+def test_the_mark_lives_in_the_campaign_state(tmp_path):
+    assert failures_from_job(tmp_path) == 0  # > no campaign: every failure counts
+    (tmp_path / "tick.json").write_text(json.dumps({"run_tag": RUN_TAG}))
+    forgive_failures(tmp_path, 42)
+    assert failures_from_job(tmp_path) == 42
+    assert json.loads((tmp_path / "tick.json").read_text())["run_tag"] == RUN_TAG
