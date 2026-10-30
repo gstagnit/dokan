@@ -236,16 +236,6 @@ class DBDispatch(DBTask):
             nonlocal session
             if opt["njobs"] <= 0:
                 return []
-            niter: int = self.config["production"]["niter"]
-            ncall: int = (opt["ntot_job"] // niter) + 1
-            if ncall * niter == 0:
-                self._logger(
-                    session,
-                    f"part {part_id} has ntot={opt['ntot_job']} -> 0 = {ncall} * {niter}",
-                    level=LogLevel.WARN,
-                )
-                # ncall = self.config["production"]["ncall_start"]
-                return []
             jobs: list[Job] = [
                 Job(
                     run_tag=self.run_tag,
@@ -254,8 +244,8 @@ class DBDispatch(DBTask):
                     policy=self.config["exe"]["policy"],
                     status=JobStatus.QUEUED,
                     timestamp=0.0,
-                    ncall=ncall,
-                    niter=niter,
+                    ncall=opt["ncall"],
+                    niter=opt["niter"],
                     elapsed_time=opt["T_job"],  # a time estimate
                 )
                 for _ in range(opt["njobs"])

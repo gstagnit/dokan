@@ -872,7 +872,7 @@ class DBTask(Task, metaclass=ABCMeta):
         result["T_target"] = max(0.0, result["T_target"])
 
         # > split up into jobs
-        # (T_max_job, T_job, njobs, ntot_job)
+        # (T_max_job, T_job, njobs, ntot_job = ncall * niter)
         result["tot_error_estimate_jobs"] = 0.0
         for part_id, ires in result["part"].items():
             # > 10 sigma buffer but never larger than 50% runtime
@@ -884,21 +884,28 @@ class DBTask(Task, metaclass=ABCMeta):
 
             # > target runtime for one job corrected for buffer
             t_max_job: float = self.config["run"]["job_max_runtime"] * (1.0 - tau_buf / ires["tau"])
+            niter: int = self.config["production"]["niter"]
+            ntot_min: int = niter * self.config["production"]["ncall_start"]
+            ntot_max: int = int(t_max_job / ires["tau"])
+            # > the size is set even without jobs: it is the job the part *would* get,
+            # > which also sizes the one-job fallback in `DBDispatch._repopulate`
+            njobs: int = 0
+            ntot_job: int = min(ntot_min, ntot_max)
             if self.config["run"]["job_fill_max_runtime"]:
-                njobs: int = round(ires["T_opt"] / t_max_job)
-                ntot_job: int = int(t_max_job / ires["tau"])
-            else:
-                if ires["T_opt"] > 0.0:
-                    ntot_min: int = (
-                        self.config["production"]["niter"] * self.config["production"]["ncall_start"]
-                    )
-                    ntot_max: int = int(t_max_job / ires["tau"])
-                    njobs: int = int(ires["T_opt"] / t_max_job) + 1
-                    ntot_job: int = int(ires["T_opt"] / float(njobs) / ires["tau"])
-                    ntot_job = min(ntot_max, max(ntot_min, ntot_job))
-                else:
-                    njobs: int = 0
-                    ntot_job: int = 0
+                njobs = round(ires["T_opt"] / t_max_job)
+                ntot_job = ntot_max
+            elif ires["T_opt"] > 0.0:
+                njobs = int(ires["T_opt"] / t_max_job) + 1
+                ntot_job = int(ires["T_opt"] / float(njobs) / ires["tau"])
+                ntot_job = min(ntot_max, max(ntot_min, ntot_job))
+
+            # > round up to whole iterations (at least one call each); this may eat into
+            # > the buffer but must not exceed the runtime limit (unless ncall = 1, see `_stuck_parts`)
+            ncall: int = max(1, -(-ntot_job // niter))
+            ncall = min(ncall, max(1, int(self.config["run"]["job_max_runtime"] / (ires["tau"] * niter))))
+            ntot_job = ncall * niter
+
+
 
             # > if we inflated the error of a count==1 part, we only want to register *one* job
             if (
@@ -914,6 +921,8 @@ class DBTask(Task, metaclass=ABCMeta):
             ires["T_job"] = t_job
             ires["njobs"] = njobs
             ires["ntot_job"] = ntot_job
+            ires["ncall"] = ncall
+            ires["niter"] = niter
             i_t: float = ires.pop("i_T")  # pop it here
             denom_jobs: float = i_t + t_jobs
             result["tot_error_estimate_jobs"] += cache[part_id]["error"] ** 2 * (
