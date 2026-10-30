@@ -40,7 +40,6 @@ from ._jobstatus import JobStatus
 from ._loglevel import LogLevel
 from ._sqla import Job, Log, Part
 
-
 # > `raw/<part>.hdf5` is a *derived* cache: every observable in it is rebuilt from
 # > the raw `.dat` job outputs, so an unusable one is always recoverable and must
 # > never fail the part.  A writer killed mid-write (OOM, SIGKILL) leaves two
@@ -261,7 +260,7 @@ class MergePart(DBMerge):
             "cap_hit": 0,
             "bins_no_plateau": 0,
         }
-        for obs, task in mrg_obs_dict.items():
+        for task in mrg_obs_dict.values():
             record = getattr(task, "file_record", None)
             meta = read_json_sidecar(record) if record is not None else None
             diag = meta.get("diag") if isinstance(meta, dict) else None
@@ -273,7 +272,9 @@ class MergePart(DBMerge):
         if not (agg["bins_flagged"] or agg["n_trimmed"] or agg["bins_no_plateau"]):
             return
 
-        pct = lambda a, b: f"{100.0 * a / b:.0f}%" if b else "n/a"
+        def pct(a: int, b: int) -> str:
+            return f"{100.0 * a / b:.0f}%" if b else "n/a"
+
         parts: list[str] = []
         if agg["bins_flagged"]:
             # > the number that matters is the share of dataset-slots actually removed,

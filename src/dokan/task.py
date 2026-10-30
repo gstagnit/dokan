@@ -4,6 +4,7 @@ sub-class of a luigi Task to impose mandatory attributes to a workflow task.
 """
 
 from pathlib import Path
+from typing import ClassVar
 
 import luigi
 from luigi.parameter import ParameterVisibility
@@ -28,8 +29,9 @@ class SharedDictParameter(luigi.DictParameter):
     to "no sharing" rather than to the wrong value.
     """
 
-    _canonical: dict[int, object] = {}
-    _canonical_str: dict[int, tuple] = {}
+    # > deliberately class-level: the cache is shared by every instance in the process
+    _canonical: ClassVar[dict[int, object]] = {}
+    _canonical_str: ClassVar[dict[int, tuple]] = {}
 
     def normalize(self, value):
         frozen = super().normalize(value)

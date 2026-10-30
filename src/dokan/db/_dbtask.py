@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import math
 import os
@@ -17,8 +18,8 @@ from sqlalchemy.orm import Session  # , scoped_session, sessionmaker
 
 from ..exe import ExecutionMode, ExecutionPolicy, ExeData
 from ..task import Task
-from ._jobstatus import JobStatus
 from ._dbopt import hist_objective
+from ._jobstatus import JobStatus
 from ._loglevel import LogLevel
 from ._sqla import DokanDB, DokanLog, Job, Log, Part
 
@@ -1102,10 +1103,8 @@ def _log_failure(task, message: str) -> None:
             session.add(Log(level=LogLevel.ERROR, timestamp=time.time(), message=message))
             session.commit()
     except Exception:
-        try:
+        with contextlib.suppress(Exception):
             _console.print(f"[red]{message}[/red]")
-        except Exception:
-            pass
 
 
 @Task.event_handler(luigi.Event.FAILURE)

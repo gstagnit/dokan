@@ -230,9 +230,13 @@ _DOC: dict[str, dict[str, str]] = {
     },
     "production": {
         "ncores": "cores per production job",
-        "ncall_start": "events per iteration of the pre-production job, and the floor for all production jobs",
+        "ncall_start": (
+            "events per iteration of the pre-production job, and the floor for all production jobs"
+        ),
         "niter": "iterations per production job",
-        "penalty_wrt_warmup": "expected slowdown of production w.r.t. warmup, used to size the pre-production",
+        "penalty_wrt_warmup": (
+            "expected slowdown of production w.r.t. warmup, used to size the pre-production"
+        ),
         "fac_merge_trigger": "re-merge a part once (#done + #merged + 1) / (#merged + 1) exceeds this (> 1)",
         "min_number": "production jobs a part needs before its error is trusted by the optimiser",
     },

@@ -8,6 +8,7 @@ shared by the dokan workflow (`dokan.db._dbmerge`) and the standalone
 `nnlojet-merge` tool.  Nothing here touches the database.
 """
 
+import contextlib
 import os
 import re
 import subprocess
@@ -15,7 +16,6 @@ import time
 from enum import IntEnum, unique
 from pathlib import Path
 
-import contextlib
 import h5py
 import luigi
 import numpy as np
@@ -473,7 +473,8 @@ def build_obs_group(
                                     f"malformed histogram row for observable '{obs}' in "
                                     f"{base_path / obs_files[obs][0]} (row {nrows}): {len(arr_f64)} columns "
                                     f"with nx={nx}, expected nx + 2*ncols with ncols={ncols or ncols_ // 2} "
-                                    f"(e.g. a `cross > <name> nbins=...` histogram mixes a total row with binned rows)"
+                                    "(e.g. a `cross > <name> nbins=...` histogram mixes a total row"
+                                    " with binned rows)"
                                 )
                             ncols_ = ncols_ // 2  # pairs of: (val,err) in columns
                             if ncols == 0:
@@ -564,8 +565,9 @@ def build_obs_group(
                         else:
                             if len(line.split()) != nx + 2 * ncols:
                                 raise ValueError(
-                                    f"malformed histogram row for observable '{obs}' in {base_path / ifile} "
-                                    f"(row {irow + 1}): {len(line.split())} columns, expected {nx + 2 * ncols}"
+                                    f"malformed histogram row for observable '{obs}' in {base_path / ifile}"
+                                    f" (row {irow + 1}): {len(line.split())} columns,"
+                                    f" expected {nx + 2 * ncols}"
                                 )
                             data_lines.append(line)
                             data_irows.append(irow)
