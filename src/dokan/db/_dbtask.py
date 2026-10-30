@@ -643,9 +643,13 @@ class DBTask(Task, metaclass=ABCMeta):
         )
         # > stuck parts keep entering the totals but receive no new runtime
         stuck, stalled = self._stuck_parts(session)
+        # > parts with an active production job: one without a runtime estimate is waiting for it
+        in_flight: set[int] = set()
 
         # > PreProduction guarantees there's a production job for any new policy
         for job in session.scalars(select_job):
+            if job.status in JobStatus.active_list():
+                in_flight.add(job.part_id)
             if job.part_id not in cache:
                 cache[job.part_id] = {
                     "Ttot": job.part.Ttot,
@@ -705,15 +709,28 @@ class DBTask(Task, metaclass=ABCMeta):
 
         # > parts with only active (no successful) production jobs provide no runtime
         # > estimate (norm == 0 would divide by zero below): skip them this round;
-        # > their in-flight jobs will supply the estimate once they complete
-        for part_id in [pid for pid, ic in cache.items() if ic["norm"] == 0]:
+        # > their in-flight jobs will supply the estimate once they complete.  The same
+        # > for a part without invested events (the projection below divides by them).
+        no_estimate: list[int] = [
+            pid for pid, ic in cache.items() if ic["norm"] == 0 or ic["ntot"] + ic["nextra"] <= 0
+        ]
+        for part_id in no_estimate:
             self._logger(
                 session,
-                f"DBTask::_distribute_time: part {part_id} has no successful production job"
+                f"DBTask::_distribute_time: part {part_id} has no usable successful production job"
                 " for the current policy: skipping this round",
                 LogLevel.WARN,
             )
             del cache[part_id]
+
+        # > parts without a runtime estimate and nothing in flight to provide one: only a
+        # > new job can, so the dispatcher queues a batch of start-size jobs for them
+        active_part_ids: list[int] = list(
+            session.scalars(select(Part.id).where(Part.active.is_(True)).order_by(Part.id))
+        )
+        bootstrap: tuple[int, ...] = tuple(
+            pid for pid in active_part_ids if pid not in cache and pid not in in_flight and pid not in stuck
+        )
 
         # > `hist` / `cross_hist`: replace the per-part figures by every part's error on *one*
         # > merged target quantity (see `hist_objective`), which is what the E-L formula below
@@ -752,12 +769,13 @@ class DBTask(Task, metaclass=ABCMeta):
         tot_error: float = 0.0
         for pt in session.scalars(select(Part).where(Part.active.is_(True))):
             if pt.id not in cache:
-                self._logger(
-                    session,
-                    f"DBTask::_distribute_time: part {pt.id} ({pt.name!r}) has no production jobs"
-                    " for the current policy: skipping",
-                    LogLevel.WARN,
-                )
+                if pt.id not in bootstrap:  # > the dispatcher reports the bootstrap jobs it queues
+                    self._logger(
+                        session,
+                        f"DBTask::_distribute_time: part {pt.id} ({pt.name!r}) has no production jobs"
+                        " for the current policy: skipping",
+                        LogLevel.WARN,
+                    )
                 continue
             if cache[pt.id]["error"] > 0.0:
                 pt_min_error = min(pt_min_error, cache[pt.id]["error"])
@@ -804,6 +822,7 @@ class DBTask(Task, metaclass=ABCMeta):
             "target": objective.label if objective is not None else self.config["run"]["opt_target"],
             "stuck": stuck,  # part_id -> reason (see `_stuck_parts`)
             "stalled": stalled,
+            "bootstrap": bootstrap,  # part ids without a runtime estimate and nothing in flight
             "tot_result": 0.0,
             "tot_error": 0.0,
             "tot_error_estimate_opt": 0.0,

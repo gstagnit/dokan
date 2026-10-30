@@ -261,7 +261,10 @@ success, or when its smallest possible job (one call per iteration) is estimated
 to exceed `job_max_runtime`; it then gets no further jobs and shows as `STK` on
 the board (`status`).  Production has stalled when every part is stuck, or a
 stuck part has no result yet (the total can then never reach a finite error).
-Once no active job remains, the tick runs
+A part with no runtime estimate and nothing in flight -- all its production jobs
+failed, or left no usable runtime -- is given a batch of start-size jobs
+(`ncall_start` x `niter`) to obtain one; if that batch fails as a whole, the part
+is stuck.  Once no active job remains, the tick runs
 `MergeFinal`: the forced merge of what is done plus the per-order files and the
 completion signal, as `Entry` stage 4 does.  Later ticks then do nothing.  The
 from-scratch re-merge with the k-scan and the grids stays the explicit

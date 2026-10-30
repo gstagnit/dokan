@@ -284,10 +284,10 @@ class DBDispatch(DBTask):
             self._logger_prefix + "::repopulate: " + f"njobs = {njobs_rem}, T = {T_rem}",
         )
 
-        def queue_production(part_id: int, opt: dict) -> list[int]:
-            """Insert ``opt['njobs']`` new QUEUED production jobs and return their ids."""
+        def queue_production(part_id: int, njobs: int, ncall: int, niter: int, T_job: float) -> list[int]:
+            """Insert `njobs` new QUEUED production jobs (`T_job`: runtime estimate) and return their ids."""
             nonlocal session
-            if opt["njobs"] <= 0:
+            if njobs <= 0:
                 return []
             jobs: list[Job] = [
                 Job(
@@ -297,11 +297,11 @@ class DBDispatch(DBTask):
                     policy=self.config["exe"]["policy"],
                     status=JobStatus.QUEUED,
                     timestamp=0.0,
-                    ncall=opt["ncall"],
-                    niter=opt["niter"],
-                    elapsed_time=opt["T_job"],  # a time estimate
+                    ncall=ncall,
+                    niter=niter,
+                    elapsed_time=T_job,  # a time estimate
                 )
-                for _ in range(opt["njobs"])
+                for _ in range(njobs)
             ]
             session.add_all(jobs)
             self._safe_commit(session)
@@ -460,6 +460,34 @@ class DBDispatch(DBTask):
             if self._apply_health(session, opt_dist["stuck"], opt_dist["stalled"]):
                 return False
 
+            if opt_dist["bootstrap"]:
+                # > a part without a runtime estimate and nothing in flight that could provide
+                # > one (its jobs failed, or left no usable runtime): only a new job gives it one,
+                # > so queue a batch of start-size jobs and dispatch it right away.  This comes
+                # > before the accuracy check, whose total does not include such a part yet.
+                # > A batch that fails as a whole makes the part stuck (`_stuck_parts`).
+                self.part_id = opt_dist["bootstrap"][0]
+                job_max_runtime: float = self.config["run"]["job_max_runtime"]
+                njobs_boot: int = int(
+                    min(self.config["run"]["jobs_batch_size"], njobs_rem, max(1.0, T_rem // job_max_runtime))
+                )
+                ids = queue_production(
+                    self.part_id,
+                    njobs_boot,
+                    self.config["production"]["ncall_start"],
+                    self.config["production"]["niter"],
+                    job_max_runtime,  # > no estimate: book the most a job may take
+                )
+                self._logger(
+                    session,
+                    self._logger_prefix
+                    + "::repopulate:  "
+                    + f"register [bold]{len(ids)}[/bold] start-size jobs for"
+                    + f" {session.get_one(Part, self.part_id).name}: no runtime estimate yet"
+                    + f" [dim](job_ids = {ids})[/dim]",
+                )
+                break
+
             # > interrupt when target accuracy reached (`tot_error` is on the optimisation
             # > target: the cross section, or the worst merged bin/integral for `hist`)
             rel_acc: float = safe_rel_error(opt_dist["tot_error"], opt_dist["tot_result"])
@@ -532,7 +560,7 @@ class DBDispatch(DBTask):
                 if opt["njobs"] <= 0:
                     continue
                 # > register `njobs` new jobs with ncall/niter and time estimate in DB
-                ids = queue_production(part_id, opt)
+                ids = queue_production(part_id, opt["njobs"], opt["ncall"], opt["niter"], opt["T_job"])
                 pt: Part = session.get_one(Part, part_id)
                 self._logger(
                     session,
@@ -544,8 +572,9 @@ class DBDispatch(DBTask):
 
             if tot_njobs == 0:
                 # > no part can take a job (the ones with a runtime estimate are stuck, the
-                # > others wait for theirs to come back): dispatch a queued remainder if
-                # > there is one, otherwise wait -- looping on would not change the verdict
+                # > others wait for their in-flight jobs to provide one): dispatch a queued
+                # > remainder if there is one, otherwise wait -- looping on would not change
+                # > the verdict
                 if drain_part_id > 0:
                     self.part_id = drain_part_id
                     break

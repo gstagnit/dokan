@@ -1,4 +1,5 @@
-"""Parts that cannot take another production job, and how production jobs are sized.
+"""Parts that cannot take another production job, the ones that need a first job,
+and how production jobs are sized.
 
 Run with the dokan environment's interpreter, e.g.
     PYTHONPATH=src python -m pytest tests/test_production_dispatch.py
@@ -233,3 +234,39 @@ def test_the_mark_lives_in_the_campaign_state(tmp_path):
     forgive_failures(tmp_path, 42)
     assert failures_from_job(tmp_path) == 42
     assert json.loads((tmp_path / "tick.json").read_text())["run_tag"] == RUN_TAG
+
+
+def test_a_part_without_estimate_and_nothing_in_flight_is_bootstrapped(dispatch):
+    ok = _part(dispatch, "V_1")
+    lost = _part(dispatch, "V_2", error=math.inf, ntot=0)
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, lost, JobStatus.FAILED, 2)  # > below the failure limit
+    with dispatch.session as session:
+        assert dispatch._distribute_time(session, 100.0)["bootstrap"] == (lost,)
+        assert dispatch._repopulate(session) is False
+        assert dispatch.part_id == lost
+        queued = session.scalars(select(Job).where(Job.status == JobStatus.QUEUED)).all()
+        assert len(queued) == dispatch.config["run"]["jobs_batch_size"]
+        assert {(j.part_id, j.ncall, j.niter) for j in queued} == {(lost, 5, 2)}  # > ncall_start x niter
+        assert {j.elapsed_time for j in queued} == {dispatch.config["run"]["job_max_runtime"]}
+        # > in flight now: waits for its estimate instead of being bootstrapped again
+        assert dispatch._distribute_time(session, 100.0)["bootstrap"] == ()
+
+
+def test_a_stuck_part_is_not_bootstrapped(dispatch):
+    ok = _part(dispatch, "V_1")
+    lost = _part(dispatch, "V_2", error=math.inf, ntot=0)
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, lost, JobStatus.FAILED, 3)
+    with dispatch.session as session:
+        opt = dispatch._distribute_time(session, 100.0)
+    assert opt["bootstrap"] == () and opt["stalled"]  # > no result, no way to get one
+
+
+def test_a_part_waiting_for_its_estimate_is_not_bootstrapped(dispatch):
+    ok = _part(dispatch, "V_1")
+    waiting = _part(dispatch, "V_2", error=math.inf, ntot=0)
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, waiting, JobStatus.RUNNING)
+    with dispatch.session as session:
+        assert dispatch._distribute_time(session, 100.0)["bootstrap"] == ()
