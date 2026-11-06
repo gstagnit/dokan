@@ -34,7 +34,7 @@ from ..merge._core import (
     has_stale_rows,
 )
 from ..order import Order
-from ..util import format_cpu_time, read_json_sidecar, write_json_sidecar
+from ..util import format_cpu_time, read_json_sidecar, relocate_and_link, write_json_sidecar
 from ._dbopt import ObsFigure, opt_target_label, optimisation_error, read_obs_figure
 from ._dbtask import DBTask
 from ._jobstatus import JobStatus
@@ -68,6 +68,32 @@ _HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
 # > killed; it stays small because a genuine livelock has to terminate.  `submit` clears
 # > the guards at startup, so the count never carries across runs.
 _MAX_MERGE_ATTEMPTS: int = 3
+
+
+def _link_raw_hdf5(hdf5_file: Path, raw_path: Path | None) -> None:
+    """Keep the HDF5 cache in `raw_path`, symlinked from its run-local path.
+
+    Restores a lost local link to an existing target.  The target must exist before
+    linking: h5py cannot create a file through a dangling symlink (O_EXCL).
+    """
+    if raw_path is None:
+        return
+    dest_hdf5: Path = raw_path / "raw" / hdf5_file.name
+    if not hdf5_file.exists() and not dest_hdf5.exists():
+        dest_hdf5.parent.mkdir(parents=True, exist_ok=True)
+        h5py.File(dest_hdf5, "x", libver="latest").close()
+    relocate_and_link(hdf5_file, dest_hdf5)
+
+
+def _remove_hdf5_cache(hdf5_file: Path) -> None:
+    """Delete the HDF5 cache: the local link (if any) first, then the file it points to.
+
+    In this order a crash in between leaves the target to be relinked and checked
+    again, never a dangling link.
+    """
+    target: Path = hdf5_file.resolve() if hdf5_file.is_symlink() else hdf5_file
+    hdf5_file.unlink(missing_ok=True)
+    target.unlink(missing_ok=True)
 
 
 def _remove_merged_outputs(out_file: Path) -> None:
@@ -211,6 +237,11 @@ class MergePart(DBMerge):
 
         return False
 
+    @property
+    def _raw_path(self) -> Path | None:
+        raw_path = self.config["run"].get("raw_path")
+        return Path(raw_path) if raw_path is not None else None
+
     def _discard_hdf5_cache(self, hdf5_file: Path, exc: BaseException) -> None:
         """Delete an unusable HDF5 staging cache and say so in the workflow log.
 
@@ -218,7 +249,8 @@ class MergePart(DBMerge):
         because the per-part `MergePart_{part_id}` resource makes this task the
         only writer of `hdf5_file` for the duration.
         """
-        hdf5_file.unlink(missing_ok=True)
+        _remove_hdf5_cache(hdf5_file)
+        _link_raw_hdf5(hdf5_file, self._raw_path)
         self._flush_logs(
             [
                 (
@@ -429,15 +461,14 @@ class MergePart(DBMerge):
         # > NB: committing MERGED + the sentinel *before* the raw-path moves is safe: a
         # > crash mid-move lands in the same `merge_in_progress` resume path as a crash
         # > in the HDF5 phase (which the sentinel was designed for), and the moves are
-        # > idempotent (already-moved files are symlinks and get skipped).
+        # > safe to repeat (see `relocate_and_link`).
 
         # > output directory
         mrg_path: Path = self._path.joinpath("result", "part", pt_name)
         mrg_path.mkdir(parents=True, exist_ok=True)
 
         # > raw data path: need to move output files if not already moved
-        if (raw_path := self.config["run"].get("raw_path")) is not None:
-            raw_path = Path(raw_path)
+        raw_path: Path | None = self._raw_path
 
         # > populate a dictionary with all histogram files (reduces IO)
         in_files: dict[str, list[GenericPath]] = dict()
@@ -451,17 +482,10 @@ class MergePart(DBMerge):
         for rel_path, seeds in job_seeds_by_path.items():
             job_path: Path = self._path / rel_path
             exe_data = ExeData(job_path)
-            if raw_path is not None:
-                (raw_path / rel_path).mkdir(parents=True, exist_ok=True)
-
             for out in exe_data["output_files"]:
                 # > move to raw path
                 if raw_path is not None:
-                    orig_file: Path = job_path / out
-                    dest_file: Path = raw_path / rel_path / out
-                    if orig_file.exists() and not orig_file.is_symlink():
-                        shutil.move(orig_file, dest_file)
-                        orig_file.symlink_to(dest_file)
+                    relocate_and_link(job_path / out, raw_path / rel_path / out)
                 if dat := re.match(r"^.*\.([^.]+)\.s([0-9]+)\.dat", out):
                     if int(dat.group(2)) not in seeds:
                         continue  # > a failed seed of this batch
@@ -483,7 +507,6 @@ class MergePart(DBMerge):
         # we create a separate file for each `Part` to allow for parallelised processing
         # * add a mask? -> no! MergeObs should only read
         # @todo refactor into separate member routine?
-        # @todo: add move to `raw_path`
         # @todo: better to save sumf & sumf2? more convenient for unweighted combination and the k-scan.
         # Could start by storing res & err, then switch to sumf & sumf2 later.
         # Maybe an attribute to flag what of the two is stored? Helper routine to convert could also help.
@@ -493,6 +516,16 @@ class MergePart(DBMerge):
         # > process for every run() attempt, so instance attributes do not survive the
         # > restart after the yielded MergeObs complete.
         guard_file: Path = self._path / "raw" / f"{pt_name}.merge-guard.json"
+
+        # > a missing cache, or a dangling link to a lost one (e.g. an interrupted rebuild, or a
+        # > target outside the current `raw_path`), starts afresh: drop the link and the stall
+        # > guard, which may fingerprint the lost cache (dropping the guard is always safe)
+        if not hdf5_file.exists():
+            hdf5_file.unlink(missing_ok=True)
+            guard_file.unlink(missing_ok=True)
+        # > raw data path: keep the cache there.  Restore the link *before* validating, so a
+        # > restored cache is checked too
+        _link_raw_hdf5(hdf5_file, raw_path)
 
         # > single-file histogram output: every observable is fed by the same job files
         obs_in_files: dict[str, list[GenericPath]] = (
@@ -527,7 +560,8 @@ class MergePart(DBMerge):
                 shutil.rmtree(mrg_path)
                 mrg_path.mkdir()
                 guard_file.unlink(missing_ok=True)
-                hdf5_file.unlink()
+                _remove_hdf5_cache(hdf5_file)
+                _link_raw_hdf5(hdf5_file, raw_path)
 
         # > If Luigi resumed this task after yielding MergeObs, avoid touching
         # > the HDF5 file before checking MergeObs.complete(): its mtime is part
