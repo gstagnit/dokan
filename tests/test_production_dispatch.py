@@ -270,3 +270,30 @@ def test_a_part_waiting_for_its_estimate_is_not_bootstrapped(dispatch):
     _jobs(dispatch, waiting, JobStatus.RUNNING)
     with dispatch.session as session:
         assert dispatch._distribute_time(session, 100.0)["bootstrap"] == ()
+
+
+def test_runtime_estimate_covers_every_part(dispatch):
+    from dokan.db._dbmerge import _parts_without_estimate
+
+    a = _part(dispatch, "V_1")
+    b = _part(dispatch, "V_2")
+    _jobs(dispatch, a, JobStatus.MERGED)
+    _jobs(dispatch, b, JobStatus.MERGED)
+    with dispatch.session as session:
+        assert _parts_without_estimate(session, dispatch._distribute_time(session, 1.0)) == []
+
+
+def test_runtime_estimate_unavailable_with_stuck_or_unestimated_parts(dispatch):
+    from dokan.db._dbmerge import _parts_without_estimate
+
+    ok = _part(dispatch, "V_1")
+    bad = _part(dispatch, "V_2")
+    waiting = _part(dispatch, "V_3", error=math.inf, ntot=0)
+    _jobs(dispatch, ok, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.MERGED)
+    _jobs(dispatch, bad, JobStatus.FAILED, 3)  # > stuck: stays in the totals, gets no runtime
+    _jobs(dispatch, waiting, JobStatus.RUNNING)  # > no estimate yet
+    with dispatch.session as session:
+        opt = dispatch._distribute_time(session, 1.0)
+        assert bad in opt["part"] and waiting not in opt["part"]
+        assert _parts_without_estimate(session, opt) == [bad, waiting]

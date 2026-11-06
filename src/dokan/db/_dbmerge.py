@@ -96,6 +96,21 @@ def _remove_hdf5_cache(hdf5_file: Path) -> None:
     target.unlink(missing_ok=True)
 
 
+def _safe_rel(error: float, result: float) -> float:
+    """Relative accuracy that tolerates a vanishing result (maps to inf, never "converged")."""
+    return abs(error / result) if result != 0.0 else math.inf
+
+
+def _parts_without_estimate(session, opt_dist: dict) -> list[int]:
+    """Active parts the runtime estimate `T_target` cannot account for.
+
+    `_distribute_time` leaves out parts without a usable runtime estimate and gives stuck
+    parts no new runtime, so with any of them the estimate is not a forecast for the run.
+    """
+    active: set[int] = set(session.scalars(select(Part.id).where(Part.active.is_(True))))
+    return sorted((active - set(opt_dist["part"])) | set(opt_dist["stuck"]))
+
+
 def _remove_merged_outputs(out_file: Path) -> None:
     """Remove a merged `.dat` file and its grid companions left by an earlier merge."""
     for path in (out_file, out_file.with_suffix(".weights.txt"), out_file.with_suffix(".pineappl.lz4")):
@@ -964,9 +979,7 @@ class MergeAll(DBMerge):
             # > use small 1s value; a non-zero time to avoid division by zero
             opt_target: str = opt_target_label(self.config)
             opt_dist = self._distribute_time(session, 1.0)
-            opt_target_rel: float = (
-                abs(opt_dist["tot_error"] / opt_dist["tot_result"]) if opt_dist["tot_result"] != 0.0 else 0.0
-            )
+            opt_target_rel: float = _safe_rel(opt_dist["tot_error"], opt_dist["tot_result"])
 
             # > Budget consumption and the runtime still wanted, reported next to the
             # > accuracy.  `_distribute_time` already yields `T_target` (the E-L estimate
@@ -990,7 +1003,12 @@ class MergeAll(DBMerge):
                 else f"  ·  {n_used} jobs (no cap)"
             )
             t_need: float = max(0.0, float(opt_dist.get("T_target") or 0.0))
-            if t_need > 0.0:
+            if no_estimate := _parts_without_estimate(session, opt_dist):
+                budget_line += (
+                    "\nstill need: unknown (parts without a runtime estimate or that cannot take"
+                    + f" further jobs: {', '.join(map(str, no_estimate))})"
+                )
+            elif t_need > 0.0:
                 budget_line += f"\nstill need ~{format_cpu_time(t_need)}"
                 if math.isfinite(t_cap):
                     t_left: float = max(0.0, t_cap - t_used)
@@ -1233,9 +1251,7 @@ class MergeFinal(DBMerge):
         return False
 
     def run(self):  # type: ignore[override]
-        def safe_rel(error: float, result: float) -> float:
-            """Relative accuracy that tolerates a vanishing result (maps to inf)."""
-            return abs(error / result) if result != 0.0 else float("inf")
+        safe_rel = _safe_rel
 
         with self.session as session:
             self._logger(session, self._logger_prefix + "::run")
@@ -1290,20 +1306,30 @@ class MergeFinal(DBMerge):
                     f"[red]reached rel. acc. {rel_acc * 1e2:.3}% on {opt_target}[/red]"
                     + f" (requested: {self.config['run']['target_rel_acc'] * 1e2:.3}%)",
                 )
-                T_target: float = opt_dist["T_target"]
-                # > because of inequality constraints, need to loop to find reliable estimate
-                while T_target / prev_T_target > 1.3:
-                    opt_dist = self._distribute_time(session, T_target)
-                    prev_T_target = T_target
-                    T_target = opt_dist["T_target"]
-                njobs_target: int = sum(ires["njobs"] for _, ires in opt_dist["part"].items())
-                self._logger(
-                    session,
-                    "still require about"
-                    + f" [bold]{format_cpu_time(T_target)}[/bold]"
-                    + " of runtime to reach desired target accuracy"
-                    + f" [dim](approx. {njobs_target} jobs)[/dim]",
-                )
+                # > the E-L estimate cannot account for parts that get no further runtime
+                if no_estimate := _parts_without_estimate(session, opt_dist):
+                    self._logger(
+                        session,
+                        "runtime estimate unavailable: parts without usable production statistics"
+                        + " or that cannot take further jobs: "
+                        + ", ".join(map(str, no_estimate)),
+                        level=LogLevel.WARN,
+                    )
+                else:
+                    T_target: float = opt_dist["T_target"]
+                    # > because of inequality constraints, need to loop to find reliable estimate
+                    while T_target / prev_T_target > 1.3:
+                        opt_dist = self._distribute_time(session, T_target)
+                        prev_T_target = T_target
+                        T_target = opt_dist["T_target"]
+                    njobs_target: int = sum(ires["njobs"] for _, ires in opt_dist["part"].items())
+                    self._logger(
+                        session,
+                        "still require about"
+                        + f" [bold]{format_cpu_time(T_target)}[/bold]"
+                        + " of runtime to reach desired target accuracy"
+                        + f" [dim](approx. {njobs_target} jobs)[/dim]",
+                    )
 
             # > mark the workflow complete (also shuts down the monitor).  Written *last*
             # > so that a failure anywhere above leaves the run incomplete instead of
