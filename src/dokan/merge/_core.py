@@ -371,7 +371,6 @@ def build_obs_group(
     histograms: dict,
     base_path: Path,
     single_file: str | None = None,
-    merge_in_progress: bool = False,
 ) -> dict[str, int]:
     """Ingest per-observable `.dat` files into an HDF5 group (DB-free).
 
@@ -494,6 +493,9 @@ def build_obs_group(
                     h5dat_xval = h5grp_obs.create_dataset("xval", (nrows, nx), dtype=np.float64, data=xval)
                     h5dat_xval.make_scale("x value")
                     h5dat_data.dims[0].attach_scale(h5dat_xval)
+                # > a group born with `ndat_valid` can never expose an unwritten row (see `has_stale_rows`)
+                h5grp_obs.attrs["ndat_valid"] = 0
+                h5grp_obs.attrs["rows_committed"] = 1
 
             # > all structures exist at this point
             # > time to populate new data
@@ -501,17 +503,27 @@ def build_obs_group(
             h5dat_neval: h5py.Dataset = h5grp_obs["neval"]
             h5dat_data: h5py.Dataset = h5grp_obs["data"]
             nrows, ncols, ndat_phys = h5dat_data.shape
-            ndat_old: int = int(h5grp_obs.attrs.get("ndat_valid", ndat_phys))
+            # > a missing `ndat_valid` (an older version's failed first ingestion) would let the
+            # > next ingestion silently treat the unwritten rows as valid: pin it now
+            if "ndat_valid" not in h5grp_obs.attrs:
+                h5grp_obs.attrs["ndat_valid"] = ndat_phys
+            ndat_old: int = int(h5grp_obs.attrs["ndat_valid"])
             if nx > 0:
                 xval = h5dat_data.dims[0][0][...]
 
-            in_files_old: list[GenericPath] = [file_path for file_path in h5dat_files.asstr()[:ndat_old]]
+            in_files_old: set[GenericPath] = set(h5dat_files.asstr()[:ndat_old])
             in_files_cur: list[GenericPath] = list(dict.fromkeys(obs_files[obs]))
             in_files_new: list[GenericPath] = [
                 file_path for file_path in in_files_cur if file_path not in in_files_old
             ]
             ndat_new: int = len(in_files_new)
-            if ndat_new == 0 or (h5grp_obs.attrs["timestamp"] < 0 and not merge_in_progress):
+            timestamp_old: float = float(h5grp_obs.attrs["timestamp"])
+            if ndat_new == 0:
+                if timestamp_old < 0 and in_files_old:
+                    # > interrupted after committing `ndat_valid`: only the timestamp is missing
+                    h5grp_obs.attrs["timestamp"] = max(
+                        (base_path / file_path).stat().st_mtime for file_path in in_files_old
+                    )
                 continue
             h5grp_obs.attrs["timestamp"] = -1.0  # flag merging state
             # > resize datasets to accommodate new files (only extends, never shrinks)
@@ -596,19 +608,54 @@ def build_obs_group(
                     buf_data[:chunk_len].transpose(1, 2, 0)
                 )
                 resize_obs[obs] += chunk_len
-            expected_nfiles = len(set(in_files_old).union(in_files_cur))
+            expected_nfiles = len(in_files_old.union(in_files_cur))
             assert resize_obs[obs] == expected_nfiles
+            # > stable input timestamp for MergeObs freshness checks: max mtime across all stored
+            # > files.  Never use wall-clock here — coarse-grained filesystem mtimes can make a
+            # > freshly-written .dat look stale on fast resumes.  Inputs are append-only, so fold
+            # > the new files into the stored maximum (all files if that maximum was lost).
+            files_to_stat = in_files_old.union(in_files_new) if timestamp_old < 0 else in_files_new
+            timestamp_new: float = max(
+                timestamp_old,
+                max((base_path / file_path).stat().st_mtime for file_path in files_to_stat),
+            )
             # > update ndat_valid as the final step — crash before this leaves
             # > old ndat_valid intact, excess data invisible, next run re-appends idempotently
             h5grp_obs.attrs["ndat_valid"] = resize_obs[obs]
-            # > stable input timestamp for MergeObs freshness checks: max mtime across
-            # > all stored files (old + new).  Never use wall-clock here — coarse-grained
-            # > filesystem mtimes can make a freshly-written .dat look stale on fast resumes.
-            h5grp_obs.attrs["timestamp"] = max(
-                (base_path / file_path).stat().st_mtime for file_path in set(in_files_old) | set(in_files_cur)
-            )
+            h5grp_obs.attrs["timestamp"] = timestamp_new
 
     return resize_obs
+
+
+def has_stale_rows(hdf5_file: Path, group_name: str, in_files: dict[str, list[GenericPath]]) -> bool:
+    """Whether any committed row is not a fully written entry of the current inputs.
+
+    `in_files` maps each observable to *all* its current inputs.  `build_obs_group` is
+    append-only and never revisits a committed row, so the caller must rebuild the cache
+    when this returns True.  Two kinds of stale row exist:
+
+    - a file that is no longer an input, e.g. the partial histogram of a failed seed
+      that older versions ingested;
+    - a row that was never written: older versions recorded no `ndat_valid` when the
+      first ingestion of a group failed, so the next one committed the whole physical
+      size.  Such rows keep the `neval` fill value 0.  Only groups created before
+      `rows_committed` was introduced can hold them, and only those are checked for it:
+      a legitimate `#neval 0` input must not trigger a rebuild on every merge.
+    """
+    with h5py.File(hdf5_file, "r", libver="latest", swmr=True) as h5f:
+        for obs, files in in_files.items():
+            h5grp_obs = h5f.get(f"{group_name}/{obs}")
+            if h5grp_obs is None or "data" not in h5grp_obs:
+                continue
+            ndat = int(h5grp_obs.attrs.get("ndat_valid", h5grp_obs["data"].shape[2]))
+            if ndat == 0:
+                continue
+            stored = set(h5grp_obs["files"].asstr()[:ndat])
+            if not stored <= set(files):
+                return True
+            if "rows_committed" not in h5grp_obs.attrs and np.any(h5grp_obs["neval"][:ndat] == 0):
+                return True
+    return False
 
 
 def merge_settings(config: dict) -> dict:

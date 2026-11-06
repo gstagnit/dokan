@@ -31,6 +31,7 @@ from ..merge._core import (
     _write_dat,
     _write_weights,
     build_obs_group,
+    has_stale_rows,
 )
 from ..order import Order
 from ..util import format_cpu_time, read_json_sidecar, write_json_sidecar
@@ -67,6 +68,12 @@ _HDF5_CACHE_ERRORS: tuple[type[BaseException], ...] = (OSError, KeyError)
 # > killed; it stays small because a genuine livelock has to terminate.  `submit` clears
 # > the guards at startup, so the count never carries across runs.
 _MAX_MERGE_ATTEMPTS: int = 3
+
+
+def _remove_merged_outputs(out_file: Path) -> None:
+    """Remove a merged `.dat` file and its grid companions left by an earlier merge."""
+    for path in (out_file, out_file.with_suffix(".weights.txt"), out_file.with_suffix(".pineappl.lz4")):
+        path.unlink(missing_ok=True)
 
 
 class DBMerge(DBTask, metaclass=ABCMeta):
@@ -317,7 +324,6 @@ class MergePart(DBMerge):
         in_files: dict[str, list[GenericPath]],
         *,
         single_file: str | None,
-        merge_in_progress: bool,
     ) -> None:
         """Ingest `in_files` into the part's HDF5 group, healing an unusable cache.
 
@@ -332,7 +338,6 @@ class MergePart(DBMerge):
                 self.config["run"]["histograms"],
                 self._path,
                 single_file=single_file,
-                merge_in_progress=merge_in_progress,
             )
         except _HDF5_CACHE_ERRORS as e:
             if not hdf5_file.is_file():
@@ -344,10 +349,6 @@ class MergePart(DBMerge):
                 in_files,
                 self.config["run"]["histograms"],
                 self._path,
-                # > never skip an observable flagged mid-merge: on the recreated file
-                # > nothing is flagged, and if anything were, skipping it is exactly the
-                # > empty-group outcome this rebuild exists to avoid
-                merge_in_progress=True,
                 single_file=single_file,
             )
 
@@ -362,7 +363,9 @@ class MergePart(DBMerge):
             return
 
         # > Phase 1: short DB session: collect job info, mark jobs MERGED, flag part as in-progress
-        job_rel_paths: list[str] = []
+        # > the seeds of the successful jobs, per batch directory: a batch can also hold the
+        # > (partial) histograms of its failed seeds, which must not enter the merge
+        job_seeds_by_path: dict[str, set[int]] = {}
         with self.session as session:
             pt: Part = session.get_one(Part, self.part_id)
             pt_name: str = self._part_name(self.part_id, session)  # also primes the log-prefix cache
@@ -412,7 +415,9 @@ class MergePart(DBMerge):
                 self._debug(session, self._logger_prefix + f"::run:  appending {job!r}")
                 pt.Ttot += job.elapsed_time
                 pt.ntot += job.niter * job.ncall
-                job_rel_paths.append(job.rel_path)
+                seeds = job_seeds_by_path.setdefault(job.rel_path, set())
+                if job.seed is not None:
+                    seeds.add(job.seed)
                 if not merge_in_progress:
                     job.status = JobStatus.MERGED
             if not merge_in_progress:
@@ -443,7 +448,7 @@ class MergePart(DBMerge):
             in_files[single_file] = []  # all hist in single file
         # > collect histograms from all jobs (defer any log messages to the next session)
         deferred_logs: list[tuple[str, LogLevel]] = []
-        for rel_path in job_rel_paths:
+        for rel_path, seeds in job_seeds_by_path.items():
             job_path: Path = self._path / rel_path
             exe_data = ExeData(job_path)
             if raw_path is not None:
@@ -457,7 +462,9 @@ class MergePart(DBMerge):
                     if orig_file.exists() and not orig_file.is_symlink():
                         shutil.move(orig_file, dest_file)
                         orig_file.symlink_to(dest_file)
-                if dat := re.match(r"^.*\.([^.]+)\.s[0-9]+\.dat", out):
+                if dat := re.match(r"^.*\.([^.]+)\.s([0-9]+)\.dat", out):
+                    if int(dat.group(2)) not in seeds:
+                        continue  # > a failed seed of this batch
                     if dat.group(1) in in_files:
                         in_files[dat.group(1)].append(str((job_path / out).relative_to(self._path)))
                     else:
@@ -482,6 +489,45 @@ class MergePart(DBMerge):
         # Maybe an attribute to flag what of the two is stored? Helper routine to convert could also help.
         resize_max: int = max(len(files) for files in in_files.values()) if in_files else 0
         hdf5_file = self._path / "raw" / f"{pt_name}.hdf5"
+        # > Stall-guard state must live on disk: with `workers > 1` Luigi forks a fresh
+        # > process for every run() attempt, so instance attributes do not survive the
+        # > restart after the yielded MergeObs complete.
+        guard_file: Path = self._path / "raw" / f"{pt_name}.merge-guard.json"
+
+        # > single-file histogram output: every observable is fed by the same job files
+        obs_in_files: dict[str, list[GenericPath]] = (
+            in_files
+            if single_file is None
+            else {obs: in_files.get(single_file, []) for obs in self.config["run"]["histograms"]}
+        )
+
+        # > Rebuild a cache holding rows that are not fully written entries of the current
+        # > inputs (failed seeds or unwritten rows, ingested by older versions; see
+        # > `has_stale_rows`): `build_obs_group` is append-only and would keep them forever.
+        # > The part's merged outputs and stall guard go first: observables left without
+        # > inputs get no new ones, the rebuilt cache can reproduce the old merge identity,
+        # > and a crash in between must not leave them looking fresh.
+        if hdf5_file.is_file():
+            try:
+                stale: bool = has_stale_rows(hdf5_file, pt_name, obs_in_files)
+            except _HDF5_CACHE_ERRORS as e:
+                self._discard_hdf5_cache(hdf5_file, e)
+                stale = False
+            if stale:
+                self._flush_logs(
+                    [
+                        (
+                            self._logger_prefix
+                            + "::run:  HDF5 staging cache holds rows of failed seeds or unwritten"
+                            + " rows (older dokan version); rebuilding from raw job output",
+                            LogLevel.WARN,
+                        )
+                    ]
+                )
+                shutil.rmtree(mrg_path)
+                mrg_path.mkdir()
+                guard_file.unlink(missing_ok=True)
+                hdf5_file.unlink()
 
         # > If Luigi resumed this task after yielding MergeObs, avoid touching
         # > the HDF5 file before checking MergeObs.complete(): its mtime is part
@@ -496,7 +542,9 @@ class MergePart(DBMerge):
                             if obs in h5f[pt_name] and "data" in h5f[pt_name][obs]:
                                 h5grp = h5f[pt_name][obs]
                                 nv = int(h5grp.attrs.get("ndat_valid", h5grp["data"].shape[2]))
-                                if nv > 0:
+                                # > a negative timestamp marks an unfinished ingestion:
+                                # > `build_obs_group` must complete it
+                                if nv > 0 and h5grp.attrs.get("timestamp", 0.0) >= 0:
                                     hdf5_obs_ready.add(obs)
                                     hdf5_obs_files[obs] = set(h5grp["files"].asstr()[:nv])
             except _HDF5_CACHE_ERRORS as e:
@@ -507,12 +555,6 @@ class MergePart(DBMerge):
                 self._discard_hdf5_cache(hdf5_file, e)
                 hdf5_obs_ready, hdf5_obs_files = set(), {}
 
-        # > single-file histogram output: every observable is fed by the same job files
-        obs_in_files: dict[str, list[GenericPath]] = (
-            in_files
-            if single_file is None
-            else {obs: in_files.get(single_file, []) for obs in self.config["run"]["histograms"]}
-        )
         resume_hdf5 = (
             merge_in_progress
             and bool(hdf5_obs_ready)
@@ -534,7 +576,6 @@ class MergePart(DBMerge):
                     pt_name,
                     in_files,
                     single_file=single_file,
-                    merge_in_progress=merge_in_progress,
                 )
             except Exception as e:
                 # > surface the failure in the workflow log: Luigi only prints it to the
@@ -597,10 +638,6 @@ class MergePart(DBMerge):
         pending_obs = {
             obs: mrg_obs for obs, mrg_obs in mrg_obs_dict.items() if not mrg_obs.complete(obs_identity[obs])
         }
-        # > Stall-guard state must live on disk: with `workers > 1` Luigi forks a fresh
-        # > process for every run() attempt, so instance attributes do not survive the
-        # > restart after the yielded MergeObs complete.
-        guard_file: Path = self._path / "raw" / f"{pt_name}.merge-guard.json"
         if pending_obs:
             # > Stall guard: Luigi restarts run() from the top each time the yielded MergeObs
             # > complete, so an observable that never reports complete() would have us re-yield it
@@ -951,6 +988,8 @@ class MergeAll(DBMerge):
             nx: int = hist_info["nx"]
             qwgt: bool = self.grids and _obs_has_grid(hist_info)
             if len(in_files[obs]) == 0:
+                # > drop a previous result: its inputs may have been invalidated by a part rebuild
+                _remove_merged_outputs(out_file)
                 deferred_logs.append((self._logger_prefix + f"::run:  no files for {obs}", LogLevel.ERROR))
                 continue
             acc = _accumulate_dat(
@@ -962,6 +1001,7 @@ class MergeAll(DBMerge):
                 ),
             )
             if acc is None:
+                _remove_merged_outputs(out_file)
                 deferred_logs.append(
                     (self._logger_prefix + f"::run:  no usable files for {obs}", LogLevel.ERROR)
                 )
@@ -1050,6 +1090,11 @@ class MergeAll(DBMerge):
                     orders_to_write.append((out_order, [pt.name for pt in matched_parts]))
 
             # > filesystem I/O + pineappl-merge subprocess: no DB session held
+            # > drop results of orders that can no longer be written (e.g. an invalidated part)
+            skipped_orders = set(Order) - {out_order for out_order, _ in orders_to_write}
+            for out_order in skipped_orders:
+                for obs in self.config["run"]["histograms"]:
+                    _remove_merged_outputs(fin_path / f"{out_order}.{obs}.dat")
             for out_order, matched_names in orders_to_write:
                 in_files_fin = dict((obs, []) for obs in self.config["run"]["histograms"])
                 for pt_name in matched_names:
@@ -1072,6 +1117,7 @@ class MergeAll(DBMerge):
                     nx: int = hist_info["nx"]
                     qwgt: bool = self.grids and _obs_has_grid(hist_info)
                     if len(in_files_fin[obs]) == 0:
+                        _remove_merged_outputs(out_file)
                         deferred_logs.append(
                             (self._logger_prefix + f"::run:  no files for {obs}", LogLevel.ERROR)
                         )
@@ -1088,6 +1134,7 @@ class MergeAll(DBMerge):
                         ),
                     )
                     if acc is None:
+                        _remove_merged_outputs(out_file)
                         deferred_logs.append(
                             (self._logger_prefix + f"::run:  no usable files for {obs}", LogLevel.ERROR)
                         )
