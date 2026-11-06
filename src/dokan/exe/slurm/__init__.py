@@ -6,13 +6,28 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 from ..._types import GenericPath
 from ...db._loglevel import LogLevel
 from .._exe_data import ExeData
 from .._executor import Executor
 from .._queue import QueueSnapshot, QueueStatus
+
+
+class SlurmTemplateFields(NamedTuple):
+    """`${name}` placeholders available in a SLURM submission template."""
+
+    exe: str
+    job_path: str
+    ncores: int
+    njobs_minus_1: int
+    all_seeds: str
+    start_seed: int
+    end_seed: int
+    input_files: str
+    max_runtime: str
+
 
 # > Slurm states -> what dokan cares about (terminal states are not queued at all)
 _SLURM_STATUS: dict[str, QueueStatus] = {
@@ -25,6 +40,7 @@ _SLURM_STATUS: dict[str, QueueStatus] = {
 
 class SlurmExec(Executor):
     _file_sub: str = "job.sub"
+    template_fields = SlurmTemplateFields._fields
     # > Slurm states (`squeue --format=%T`) that will not produce further work;
     # > anything else is treated as still active.
     _state_terminal: ClassVar[set[str]] = {
@@ -199,23 +215,22 @@ class SlurmExec(Executor):
             return
 
         # > populate the submission template file
-        slurm_settings: dict = {
-            "exe": self.exe_data["exe"],
-            "job_path": str(self.exe_data.path.absolute()),
-            "ncores": self.exe_data["policy_settings"].get("slurm_ncores", 1),
-            "njobs_minus_1": len(self.exe_data["jobs"]) - 1,
-            "all_seeds": " ".join(str(job["seed"]) for job in self.exe_data["jobs"].values()),
-            "start_seed": min(job["seed"] for job in self.exe_data["jobs"].values()),
-            "end_seed": max(job["seed"] for job in self.exe_data["jobs"].values()),
-            "input_files": ", ".join(self.exe_data["input_files"]),
-            "max_runtime": self._format_slurm_time(int(self.exe_data["policy_settings"]["max_runtime"])),
-            # "max_runtime": int(self.exe_data["policy_settings"]["max_runtime"]),
-        }
+        fields = SlurmTemplateFields(
+            exe=self.exe_data["exe"],
+            job_path=str(self.exe_data.path.absolute()),
+            ncores=self.exe_data["policy_settings"].get("slurm_ncores", 1),
+            njobs_minus_1=len(self.exe_data["jobs"]) - 1,
+            all_seeds=" ".join(str(job["seed"]) for job in self.exe_data["jobs"].values()),
+            start_seed=min(job["seed"] for job in self.exe_data["jobs"].values()),
+            end_seed=max(job["seed"] for job in self.exe_data["jobs"].values()),
+            input_files=", ".join(self.exe_data["input_files"]),
+            max_runtime=self._format_slurm_time(int(self.exe_data["policy_settings"]["max_runtime"])),
+        )
         with open(self.slurm_template) as t, open(self.file_sub, "w") as f:
-            f.write(string.Template(t.read()).substitute(slurm_settings))
+            f.write(string.Template(t.read()).substitute(fields._asdict()))
 
         job_env = os.environ.copy()
-        job_env["OMP_NUM_THREADS"] = f"{slurm_settings['ncores']}"
+        job_env["OMP_NUM_THREADS"] = f"{fields.ncores}"
         job_env["OMP_STACKSIZE"] = "1024M"
 
         cluster_id: int = -1  # init failed state

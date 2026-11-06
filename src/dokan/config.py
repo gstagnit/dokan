@@ -295,6 +295,16 @@ _transient: list[tuple[str, str]] = [
     ("run", "failures_from_job"),  # `tick` (kept in `tick.json`)
 ]
 
+# > suffixes (after `{policy}_`) of `exe.policy_settings` keys that may stay unset: every other
+# > `{policy}_*` key of the schema is required to submit with that policy
+# > (see `Config.missing_policy_settings`)
+_optional_policy_settings: frozenset[str] = frozenset(
+    {
+        "ncores",  # Luigi resource / executor default
+        "njobs_per_node",  # @todo: currently unused (future feature)
+    }
+)
+
 _OPT_TARGETS: tuple[str, ...] = ("cross", "cross_hist", "hist")
 
 
@@ -446,3 +456,25 @@ class Config(UserDict):
         # > `read_config_json` strips them, other readers must do the same
         with open(self.file_cfg, "w") as cfg:
             cfg.write(annotate_config_json(json.dumps(data, indent=2)))
+
+    def missing_policy_settings(self) -> list[str]:
+        """List the policy settings the execution policy needs but this config lacks.
+
+        Each `{policy}_*` key of the schema is required unless its suffix is in
+        `_optional_policy_settings`. A configured template must also exist in the run
+        folder for `DBRunner` to find it.
+        """
+        prefix: str = f"{str(self.data['exe']['policy']).lower()}_"
+        settings: dict = self.data["exe"]["policy_settings"]
+        missing: list[str] = [
+            key
+            for key in _schema["exe"]["policy_settings"]
+            if key.startswith(prefix)
+            and key.removeprefix(prefix) not in _optional_policy_settings
+            and key not in settings
+        ]
+        if (template := settings.get(f"{prefix}template")) is not None and (
+            self.path is None or not (Path(self.path) / template).is_file()
+        ):
+            missing.append(f"{prefix}template file {template!r} in the run folder")
+        return missing
