@@ -82,7 +82,9 @@ class DBDoctor(DBTask):
                 )
 
                 if jobs:
-                    self._update_job(session, exe_data, jobs, add_missing=True, skip_terminated=False)
+                    self._update_job(
+                        session, exe_data, jobs, add_missing=True, skip_terminated=False, skip_active=True
+                    )
                 else:
                     # > find files that match job execution results in the same folder
                     other_files = [p for p in exe_dir.iterdir() if re.match(r".*\.s\d+\..*", p.name)]

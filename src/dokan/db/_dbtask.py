@@ -38,6 +38,11 @@ class _DBRole(Enum):
 # > session-level retries (see `DBTask._safe_commit`)
 _SQLITE_TIMEOUT: int = 420  # seconds
 
+# > rows a batch queue still owns (`_update_job(skip_active=True)`).  Not `QUEUED`: it has
+# > no batch yet, and one with a directory is an inconsistency that `tick` leaves to the
+# > doctor; not `RECOVER`: it marks rows mid-resurrection, which `_update_job` settles
+_IN_FLIGHT: tuple[JobStatus, ...] = (JobStatus.DISPATCHED, JobStatus.RUNNING)
+
 # > all connection-scoped settings in one place, applied to *every* new
 # > connection via the pool `connect` event — `journal_mode`, `synchronous`,
 # > `temp_store`, and `foreign_keys` are per-connection PRAGMAs, so applying
@@ -275,6 +280,7 @@ class DBTask(Task, metaclass=ABCMeta):
         *,
         add_missing: bool = False,
         skip_terminated: bool = True,
+        skip_active: bool = False,
     ) -> None:
         """Synchronize job rows from an `ExeData["jobs"]` payload.
 
@@ -289,14 +295,23 @@ class DBTask(Task, metaclass=ABCMeta):
             all job ids found in `exe_data["jobs"]` are considered and rows
             are loaded lazily.
         add_missing : bool, optional
-            If True, create missing DB jobs from ExeData entries.
+            If True, create missing DB jobs from ExeData entries, under their
+            ExeData job id.  A job id that the DB has given to a job in
+            another directory (ids are reissued after a DB restore) is left
+            alone with a warning, as is a seed the part already has.
         skip_terminated : bool, optional
             If True, do not overwrite rows that are already terminated.
+        skip_active : bool, optional
+            If True, do not touch rows that are dispatched or running.  For
+            callers without a view of the batch queue (doctor): a missing
+            result means "not finished yet" as often as "failed", and only
+            the queue (tick / submit) can tell which.
 
         Notes
         -----
         - `job_id` keys are normalized to `int`.
-        - A missing/invalid result payload marks non-recovery jobs as FAILED.
+        - A missing/invalid result payload marks non-recovery jobs as FAILED
+          (in-flight ones excepted with `skip_active`).
         - This method commits once at the end.
         """
         exe_jobs = exe_data.get("jobs", {})
@@ -339,14 +354,32 @@ class DBTask(Task, metaclass=ABCMeta):
                 level=LogLevel.WARN,
             )
 
+        rel_path: str | None = str(exe_data.path.relative_to(self._local())) if add_missing else None
+        n_active: int = 0
         for job_id in _jobs:
             job: Job | None = _jobs[job_id]
             if job is None:
                 job = session.get(Job, job_id)  # fetch from DB
+                if add_missing and job is not None and job.rel_path != rel_path:
+                    # > the id belongs to another job: after a DB restore the ids of lost
+                    # > rows are reissued, so a directory left behind by the lost rows can
+                    # > name ids that now mean something else.  Neither job may be touched.
+                    self._logger(
+                        session,
+                        f"_update_job: job {job_id} of {rel_path} belongs to {job.rel_path} in the DB"
+                        " (id reissued after a DB restore?): leaving both alone,"
+                        f" seed {(exe_jobs.get(job_id) or {}).get('seed')} is not adopted",
+                        LogLevel.WARN,
+                    )
+                    continue
 
             job_entry = exe_jobs.get(job_id)
 
             if skip_terminated and job and job.status in JobStatus.terminated_list():
+                continue
+
+            if skip_active and job and job.status in _IN_FLIGHT:
+                n_active += 1
                 continue
 
             if job_entry is None:
@@ -367,17 +400,38 @@ class DBTask(Task, metaclass=ABCMeta):
                         # assert exe_data["part_id"] == part.id, f"part_id mismatch for {exe_data.path}"
                         # @note:  independent runs could assign different part ids?
                         pass
+                    mode = ExecutionMode(exe_data["mode"])
+                    twin: Job | None = session.scalars(
+                        select(Job)
+                        .where(Job.part_id == part.id)
+                        .where(Job.mode == mode)
+                        .where(Job.seed == job_entry["seed"])
+                    ).first()
+                    if twin is not None:
+                        # > (part, mode, seed) is unique: the seed was re-run elsewhere
+                        self._logger(
+                            session,
+                            f"_update_job: job {job_id} of {rel_path} not found, but its seed"
+                            f" {job_entry['seed']} is already job {twin.id} of {twin.rel_path}: not adopted",
+                            LogLevel.WARN,
+                        )
+                        continue
                     self._logger(session, f"_update_job: job {job_id} not found, adding new entry")
+                    # > keep the ExeData id (free: `session.get` found nothing), so the next
+                    # > doctor matches the row to its entry instead of adopting it again;
+                    # > set the relationship, not just `part_id`: `job.part` is read below,
+                    # > before any flush could load it
                     job = Job(
-                        part_id=part.id,
+                        id=job_id,
+                        part=part,
                         run_tag=exe_data["timestamp"],
                         status=JobStatus.RECOVER,
-                        mode=ExecutionMode(exe_data["mode"]),
+                        mode=mode,
                         policy=ExecutionPolicy(exe_data["policy"]),
                         timestamp=exe_data["timestamp"],
                         ncall=exe_data["ncall"],
                         niter=exe_data["niter"],
-                        rel_path=str(exe_data.path.relative_to(self._local())),
+                        rel_path=rel_path,
                         elapsed_time=0.0,
                         seed=job_entry["seed"],
                     )
@@ -447,6 +501,12 @@ class DBTask(Task, metaclass=ABCMeta):
             # @todo: status restoration infra
             # @todo: trigger on change if status is in success_list and report & overwrite.
 
+        if n_active:
+            self._logger(
+                session,
+                f"_update_job: {n_active} job(s) of {exe_data.path.name} still in flight:"
+                " left for the batch queue to settle",
+            )
         self._safe_commit(session)
 
     def budget(self) -> tuple[float, float, bool]:
